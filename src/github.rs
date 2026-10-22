@@ -22,6 +22,21 @@ pub struct GitHubApp {
     test_endpoint: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct GitHubConfigurationError {
+    pub status: u16,
+}
+impl fmt::Display for GitHubConfigurationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GitHub repository installation is not configured (HTTP {})",
+            self.status
+        )
+    }
+}
+impl std::error::Error for GitHubConfigurationError {}
+
 pub struct InstallationToken {
     pub token: String,
     pub expires_at: DateTime<Utc>,
@@ -125,6 +140,15 @@ impl GitHubApp {
             // Deliberately discard underlying errors: URLs, headers, and body
             // contents from third-party errors must not reach logs.
             .map_err(|_| anyhow!("GitHub installation token request failed"))?;
+        if matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            return Err(GitHubConfigurationError {
+                status: response.status().as_u16(),
+            }
+            .into());
+        }
         ensure!(
             response.status() == StatusCode::CREATED,
             "GitHub installation token request returned HTTP {}",
@@ -369,6 +393,15 @@ mod tests {
             json!({"token": SECRET,"expires_at": SECRET}).to_string(),
         ] {
             assert_redacted(exchange("201 Created", body).await.unwrap_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_repository_scope_failures_are_typed_without_exposing_bodies() {
+        for status in ["404 Not Found", "422 Unprocessable Entity"] {
+            let error = exchange(status, SECRET.into()).await.unwrap_err();
+            assert!(error.is::<GitHubConfigurationError>());
+            assert_redacted(error);
         }
     }
 

@@ -67,7 +67,7 @@ VALUES
 
 Task `repo_url` must be `https://github.com/owner/repository` or the same URL ending in `.git`. The owner and repository name match case-insensitively. An unconfigured repository, another tenant's model key path, or a missing or invalid model secret fails the task immediately with a specific reason. Transient secret-service errors retry. Task instructions cannot select installation IDs or parameter paths. There is no public binding-management API.
 
-When both GitHub settings are absent, the existing hello flow still runs with an encrypted callback token only. When configured, the reconciler mints an installation token for exactly the bound repository with the two permissions above. The App private key stays on the orchestrator. A task bundle contains the callback token, model key, GitHub token, and expiry timestamps. Standard Parameter Store bundles are limited to 4096 bytes; oversized credentials fail before any SSM send.
+When both GitHub settings are absent, the existing hello flow still runs with an encrypted callback token only. When configured, the reconciler mints an installation token for exactly the bound repository with the two permissions above. The App private key stays on the orchestrator. A task bundle contains the callback token, model key, GitHub token, and expiry timestamps. Standard Parameter Store bundles are limited to 4096 bytes; oversized credentials fail the task before any SSM send. GitHub HTTP 404 and 422 scope errors also fail the task with a specific reason.
 
 ## Credential lifecycle and limits
 

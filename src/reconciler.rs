@@ -185,7 +185,8 @@ impl<C: Cloud, G: RepositoryTokenIssuer> Reconciler<C, G> {
             Ok(access) => access,
             Err(error)
                 if error.is::<credentials::RepositoryConfigurationError>()
-                    || error.is::<crate::cloud::SecretConfigurationError>() =>
+                    || error.is::<crate::cloud::SecretConfigurationError>()
+                    || error.is::<crate::github::GitHubConfigurationError>() =>
             {
                 db::fail_agent_start(&mut *tx, task.id, &error.to_string()).await?;
                 tx.commit()
@@ -206,6 +207,18 @@ impl<C: Cloud, G: RepositoryTokenIssuer> Reconciler<C, G> {
             model_api_key: access.as_ref().map(|a| a.model_key.as_str()),
         };
         let value = serde_json::to_string(&credentials).context("encoding task credentials")?;
+        if value.len() > 4096 {
+            db::fail_agent_start(
+                &mut *tx,
+                task.id,
+                "task credentials exceed the 4096-byte limit",
+            )
+            .await?;
+            tx.commit()
+                .await
+                .context("committing credential size failure")?;
+            return Ok(());
+        }
         let parameter = self
             .cloud
             .put_task_secret(task.tenant_id, task.id, instance_id, &value)
@@ -1303,7 +1316,16 @@ mod tests {
         r.with_github(FakeGithub).tick().await.unwrap();
         assert!(cloud.scripts().is_empty());
         assert!(cloud.list_task_secrets().await.unwrap().is_empty());
-        assert!(task(&pool, t.id).await.agent_command_id.is_none());
+        let failed = task(&pool, t.id).await;
+        assert!(failed.agent_command_id.is_none());
+        assert_eq!(failed.state, TaskState::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("task credentials exceed the 4096-byte limit")
+        );
+        // A second tick does not try to mint or dispatch for a terminal task.
+        reconciler(&pool, &cloud).tick().await.unwrap();
+        assert!(cloud.scripts().is_empty());
     }
     #[sqlx::test]
     async fn secret_sweep_reads_live_tasks_after_a_concurrent_put(pool: PgPool) {
@@ -1338,5 +1360,37 @@ mod tests {
                 .iter()
                 .any(|s| s.name == secret.name)
         );
+    }
+    struct UninstalledGithub;
+    impl RepositoryTokenIssuer for UninstalledGithub {
+        async fn mint_repository_token(&self, _: u64, _: u64) -> anyhow::Result<InstallationToken> {
+            Err(crate::github::GitHubConfigurationError { status: 404 }.into())
+        }
+    }
+
+    #[sqlx::test]
+    async fn permanent_github_scope_errors_fail_task_and_terminate_vm(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        sqlx::query("UPDATE tasks SET repo_url = 'https://github.com/owner/repo' WHERE id = $1")
+            .bind(t.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let name = format!("/factory/{DEPLOYMENT}/tenants/{}/model-key", t.tenant_id);
+        sqlx::query("INSERT INTO repository_credentials (tenant_id, repository, installation_id, repository_id, model_key_parameter) VALUES ($1, 'owner/repo', 11, 22, $2)")
+            .bind(t.tenant_id).bind(&name).execute(&pool).await.unwrap();
+        cloud.set_source_secret(&name, "synthetic-model-key");
+        r.with_github(UninstalledGithub).tick().await.unwrap();
+        let failed = task(&pool, t.id).await;
+        assert_eq!(failed.state, TaskState::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("GitHub repository installation is not configured (HTTP 404)")
+        );
+        assert!(cloud.scripts().is_empty());
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+        assert!(cloud.alive().is_empty());
     }
 }

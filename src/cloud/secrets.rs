@@ -26,8 +26,8 @@ impl ParameterStore {
             client.config().region().map(|r| r.as_ref()) == Some(region),
             "Parameter Store client region does not match configured region"
         );
-        // A failed put may already have committed remotely. Never retry with another name
-        // here; the caller's orphan sweep recovers attempts not recorded in the database.
+        // Reads, listings, and deletes may retry safely. Immutable puts disable retries
+        // per call below; their uncertain outcomes are recovered by the orphan sweep.
         let config = client
             .config()
             .to_builder()
