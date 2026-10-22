@@ -1066,13 +1066,31 @@ mod tests {
         let cloud = Arc::new(FakeCloud::default());
         let r = reconciler(&pool, &cloud);
         let t = running_without_agent(&pool, &r, &cloud).await;
-        cloud.hang_after_next_send();
+        let sent = cloud.hang_after_next_send();
+        {
+            let tick = r.tick();
+            tokio::pin!(tick);
+            tokio::select! {
+                result = &mut tick => panic!("tick should hang after sending: {result:?}"),
+                observed = tokio::time::timeout(Duration::from_secs(10), sent.notified()) => {
+                    observed.expect("script must be accepted before abandoning the tick");
+                }
+            }
+        } // Cancel only after the fake has accepted the script.
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), r.tick())
-                .await
-                .is_err()
-        );
+        // SQLx queues rollback when the cancelled transaction is dropped. Acquire the
+        // same row lock to wait for that rollback instead of racing SKIP LOCKED next tick.
+        let mut rollback_finished = pool.begin().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sqlx::query("SELECT 1 FROM tasks WHERE id = $1 FOR UPDATE")
+                .bind(t.id)
+                .execute(&mut *rollback_finished),
+        )
+        .await
+        .expect("cancelled transaction must release its row lock")
+        .unwrap();
+        rollback_finished.rollback().await.unwrap();
         let first = cloud.scripts()[0].clone();
         let row = task(&pool, t.id).await;
         assert_eq!(row.agent_command_id, None);

@@ -43,7 +43,7 @@ struct Inner {
     scripts: Vec<SentScript>,
     ssm_unreachable: Vec<String>,
     failing_scripts: usize,
-    hang_after_next_send: bool,
+    hang_after_next_send: Option<Arc<tokio::sync::Notify>>,
     secrets: BTreeMap<String, (super::StoredTaskSecret, String, String)>,
     source_secrets: BTreeMap<String, String>,
     fail_secret_write: bool,
@@ -218,8 +218,10 @@ impl FakeCloud {
 
     /// The next accepted script is recorded as sent, but `run_script` never returns, like
     /// an SSM response that is lost.
-    pub fn hang_after_next_send(&self) {
-        self.with(|inner| inner.hang_after_next_send = true)
+    pub fn hang_after_next_send(&self) -> Arc<tokio::sync::Notify> {
+        let sent = Arc::new(tokio::sync::Notify::new());
+        self.with(|inner| inner.hang_after_next_send = Some(Arc::clone(&sent)));
+        sent
     }
 }
 
@@ -370,7 +372,7 @@ impl Cloud for FakeCloud {
                 bail!("injected SendCommand failure");
             }
             if std::mem::take(&mut inner.disconnect_on_send) {
-                return Ok((ScriptStart::NotReady, false));
+                return Ok((ScriptStart::NotReady, None));
             }
             let running = inner
                 .instances
@@ -382,7 +384,7 @@ impl Cloud for FakeCloud {
                     .iter()
                     .any(|i| i == request.instance_id)
             {
-                return Ok((ScriptStart::NotReady, false));
+                return Ok((ScriptStart::NotReady, None));
             }
             let command_id = format!("cmd-{}", inner.scripts.len() + 1);
             inner.scripts.push(SentScript {
@@ -394,7 +396,8 @@ impl Cloud for FakeCloud {
             let hang = std::mem::take(&mut inner.hang_after_next_send);
             Ok((ScriptStart::Sent { command_id }, hang))
         })?;
-        if hang {
+        if let Some(sent) = hang {
+            sent.notify_one();
             std::future::pending::<()>().await;
         }
         Ok(start)
