@@ -1,2 +1,7 @@
 /target
 .env
+.env.*
+!.env.example
+*.pem
+!tests/fixtures/github/test-private.pem
+!tests/fixtures/github/test-public.pem
