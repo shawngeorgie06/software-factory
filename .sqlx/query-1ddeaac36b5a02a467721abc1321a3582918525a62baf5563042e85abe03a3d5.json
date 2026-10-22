@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE tasks\n        SET state = 'running', heartbeat_at = now()\n        WHERE id = $1 AND state = 'launching' AND vm_instance_id IS NOT NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1ddeaac36b5a02a467721abc1321a3582918525a62baf5563042e85abe03a3d5"
+}

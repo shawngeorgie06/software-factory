@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE tasks\n        SET agent_command_id = $2\n        WHERE id = $1 AND state = 'running' AND agent_command_id IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fe87a465082d75f6650407f54e2485034516a98e5dfc487b94c83ee417404690"
+}

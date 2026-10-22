@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE tasks\n        SET heartbeat_token_hash = sha256(convert_to($2, 'UTF8'))\n        WHERE id = (\n            SELECT id FROM tasks\n            WHERE id = $1 AND state = 'running' AND agent_command_id IS NULL\n            FOR UPDATE SKIP LOCKED\n        )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2dad13c0fd4911a4689cd814399ba2d3ffdba574b8c77d4fda5956b7d4412fdc"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE tasks\n        SET vm_instance_id = $2\n        WHERE id = $1 AND state = 'launching' AND vm_instance_id IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "39521367595879ac94dc999f863e72f138d8372b9096dfaa83b8710d9809a56e"
+}

@@ -1,0 +1,187 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH active AS (\n            SELECT tenant_id, count(*) AS n\n            FROM tasks\n            WHERE state IN ('launching', 'running', 'verifying')\n            GROUP BY tenant_id\n        ),\n        queued AS (\n            SELECT id, tenant_id, created_at,\n                   row_number() OVER (PARTITION BY tenant_id ORDER BY created_at, id) AS position\n            FROM tasks\n            WHERE state = 'queued' AND expires_at > now()\n        ),\n        picked AS (\n            SELECT q.id\n            FROM queued q LEFT JOIN active a USING (tenant_id)\n            WHERE q.position + COALESCE(a.n, 0) <= $2\n            ORDER BY q.created_at, q.id\n            LIMIT $1\n        )\n        UPDATE tasks\n        SET state = 'launching', heartbeat_at = now()\n        FROM picked\n        WHERE tasks.id = picked.id AND tasks.state = 'queued'\n        RETURNING tasks.id, tasks.tenant_id, tasks.state AS \"state: TaskState\",\n                  tasks.vm_instance_id, tasks.heartbeat_at, tasks.expires_at,\n                  tasks.created_at, tasks.updated_at, tasks.repo_url, tasks.instructions,\n                  tasks.result, tasks.failure_reason, tasks.agent_command_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tenant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "tenant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "state: TaskState",
+        "type_info": {
+          "Custom": {
+            "name": "task_state",
+            "kind": {
+              "Enum": [
+                "queued",
+                "launching",
+                "running",
+                "verifying",
+                "succeeded",
+                "failed"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "vm_instance_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "vm_instance_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "heartbeat_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "heartbeat_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "repo_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "repo_url"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "instructions",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "instructions"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "result",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "result"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "failure_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "failure_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "agent_command_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "agent_command_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "c28da313db5360ab73a04cdc3f7bcc5dd785d959fe9af9841e39a9a827e8292b"
+}
