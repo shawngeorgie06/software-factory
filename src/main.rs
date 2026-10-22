@@ -8,7 +8,9 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use factory::api;
+use factory::cloud::Cloud;
 use factory::cloud::aws::{AwsCloud, AwsCloudConfig};
+use factory::github::GitHubApp;
 use factory::reconciler::{Reconciler, ReconcilerConfig};
 
 fn required(name: &str) -> anyhow::Result<String> {
@@ -48,8 +50,10 @@ async fn main() -> anyhow::Result<()> {
         subnet_id: required("FACTORY_SUBNET_ID")?,
         security_group_id: required("FACTORY_SECURITY_GROUP_ID")?,
         instance_profile_name: required("FACTORY_INSTANCE_PROFILE")?,
+        secrets_kms_key_arn: required("FACTORY_SECRETS_KMS_KEY_ARN")?,
     };
     let reconciler_config = ReconcilerConfig {
+        deployment: cloud_config.deployment.clone(),
         interval: Duration::from_secs(optional_u64("FACTORY_RECONCILE_INTERVAL_SECS", 5)?),
         heartbeat_timeout: Duration::from_secs(optional_u64(
             "FACTORY_HEARTBEAT_TIMEOUT_SECS",
@@ -103,7 +107,31 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("binding FACTORY_LISTEN_ADDR {listen_addr}"))?;
-    let reconciler = Reconciler::new(pool.clone(), cloud, reconciler_config);
+    let github = match (
+        std::env::var("FACTORY_GITHUB_APP_ID").ok(),
+        std::env::var("FACTORY_GITHUB_PRIVATE_KEY_PARAMETER").ok(),
+    ) {
+        (None, None) => None,
+        (Some(id), Some(parameter)) => {
+            anyhow::ensure!(
+                parameter
+                    == format!(
+                        "/factory/{}/control/github-private-key",
+                        reconciler_config.deployment
+                    ),
+                "GitHub private key parameter must be the deployment control parameter"
+            );
+            let pem = cloud.read_secure(&parameter).await?;
+            Some(GitHubApp::new(id, pem.as_bytes())?)
+        }
+        _ => anyhow::bail!(
+            "FACTORY_GITHUB_APP_ID and FACTORY_GITHUB_PRIVATE_KEY_PARAMETER must be set together"
+        ),
+    };
+    let mut reconciler = Reconciler::new(pool.clone(), cloud, reconciler_config);
+    if let Some(github) = github {
+        reconciler = reconciler.with_github(github);
+    }
 
     // Dropping the sender tells every receiver to stop.
     let (stop_tx, stop_rx) = watch::channel(());

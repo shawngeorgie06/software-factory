@@ -3,6 +3,7 @@
 pub mod aws;
 #[cfg(test)]
 pub mod fake;
+pub mod secrets;
 
 use std::future::Future;
 use std::time::Duration;
@@ -87,7 +88,33 @@ impl Instance {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTaskSecret {
+    pub name: String,
+    pub tenant_id: Uuid,
+    pub task_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecretReference {
+    pub name: String,
+    pub region: String,
+}
+
 pub trait Cloud: Send + Sync {
+    fn read_secure(&self, name: &str) -> impl Future<Output = anyhow::Result<String>> + Send;
+    fn put_task_secret(
+        &self,
+        tenant_id: Uuid,
+        task_id: Uuid,
+        instance_id: &str,
+        value: &str,
+    ) -> impl Future<Output = anyhow::Result<SecretReference>> + Send;
+    fn list_task_secrets(
+        &self,
+    ) -> impl Future<Output = anyhow::Result<Vec<StoredTaskSecret>>> + Send;
+    fn delete_task_secret(&self, name: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
+
     /// Launches one instance tagged with this deployment and the task and tenant ids, and
     /// returns its id.
     /// Idempotent per task: repeating the call for the same task must not create a second VM.

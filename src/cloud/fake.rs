@@ -44,6 +44,10 @@ struct Inner {
     ssm_unreachable: Vec<String>,
     failing_scripts: usize,
     hang_after_next_send: bool,
+    secrets: BTreeMap<String, (super::StoredTaskSecret, String, String)>,
+    source_secrets: BTreeMap<String, String>,
+    fail_secret_write: bool,
+    fail_secret_delete: bool,
 }
 
 /// A script `run_script` accepted.
@@ -61,6 +65,33 @@ pub struct FakeCloud {
 }
 
 impl FakeCloud {
+    pub fn set_source_secret(&self, name: &str, value: &str) {
+        self.with(|inner| {
+            inner.source_secrets.insert(name.into(), value.into());
+        });
+    }
+    pub fn secret_value(&self, name: &str) -> String {
+        self.with(|inner| inner.secrets.get(name).unwrap().1.clone())
+    }
+    pub fn secret_for_script(&self, script: &str) -> serde_json::Value {
+        let line = script
+            .lines()
+            .find(|s| s.starts_with("parameter="))
+            .unwrap();
+        let name = line
+            .strip_prefix("parameter='")
+            .unwrap()
+            .strip_suffix('\'')
+            .unwrap();
+        serde_json::from_str(&self.secret_value(name)).unwrap()
+    }
+    pub fn fail_secret_write(&self, fail: bool) {
+        self.with(|i| i.fail_secret_write = fail);
+    }
+    pub fn fail_secret_delete(&self, fail: bool) {
+        self.with(|i| i.fail_secret_delete = fail);
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
         f(&mut self.inner.lock().unwrap())
     }
@@ -175,6 +206,47 @@ impl FakeCloud {
 }
 
 impl Cloud for FakeCloud {
+    async fn read_secure(&self, name: &str) -> anyhow::Result<String> {
+        self.with(|i| i.source_secrets.get(name).cloned())
+            .ok_or_else(|| anyhow::anyhow!("secret not configured"))
+    }
+    async fn put_task_secret(
+        &self,
+        tenant_id: Uuid,
+        task_id: Uuid,
+        instance_id: &str,
+        value: &str,
+    ) -> anyhow::Result<super::SecretReference> {
+        self.with(|i| {
+            anyhow::ensure!(!i.fail_secret_write, "injected secret write failure");
+            let name = format!(
+                "/factory/{DEPLOYMENT}/tasks/{tenant_id}/{task_id}/{}",
+                Uuid::new_v4()
+            );
+            let record = super::StoredTaskSecret {
+                name: name.clone(),
+                tenant_id,
+                task_id,
+            };
+            i.secrets
+                .insert(name.clone(), (record, value.into(), instance_id.into()));
+            Ok(super::SecretReference {
+                name,
+                region: "us-east-1".into(),
+            })
+        })
+    }
+    async fn list_task_secrets(&self) -> anyhow::Result<Vec<super::StoredTaskSecret>> {
+        Ok(self.with(|i| i.secrets.values().map(|(s, _, _)| s.clone()).collect()))
+    }
+    async fn delete_task_secret(&self, name: &str) -> anyhow::Result<()> {
+        self.with(|i| {
+            anyhow::ensure!(!i.fail_secret_delete, "injected delete failure");
+            i.secrets.remove(name);
+            Ok(())
+        })
+    }
+
     async fn launch(&self, request: &LaunchRequest) -> anyhow::Result<String> {
         let token = request.task_id.to_string();
         let existing = self.with(|inner| {
@@ -284,6 +356,25 @@ impl Cloud for FakeCloud {
 
 /// Lets a test keep a handle on the fake while a reconciler owns it.
 impl<C: Cloud> Cloud for Arc<C> {
+    async fn read_secure(&self, name: &str) -> anyhow::Result<String> {
+        C::read_secure(self, name).await
+    }
+    async fn put_task_secret(
+        &self,
+        tenant_id: Uuid,
+        task_id: Uuid,
+        instance_id: &str,
+        value: &str,
+    ) -> anyhow::Result<super::SecretReference> {
+        C::put_task_secret(self, tenant_id, task_id, instance_id, value).await
+    }
+    async fn list_task_secrets(&self) -> anyhow::Result<Vec<super::StoredTaskSecret>> {
+        C::list_task_secrets(self).await
+    }
+    async fn delete_task_secret(&self, name: &str) -> anyhow::Result<()> {
+        C::delete_task_secret(self, name).await
+    }
+
     async fn launch(&self, request: &LaunchRequest) -> anyhow::Result<String> {
         C::launch(self, request).await
     }
