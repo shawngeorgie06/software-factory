@@ -59,18 +59,28 @@ pub fn repository_name(url: &str) -> anyhow::Result<String> {
     Ok(path.to_ascii_lowercase())
 }
 
+#[derive(Debug)]
+pub struct RepositoryConfigurationError(pub &'static str);
+impl std::fmt::Display for RepositoryConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for RepositoryConfigurationError {}
+
 pub async fn for_task<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     tenant_id: Uuid,
     repo_url: &str,
 ) -> anyhow::Result<RepositoryCredentials> {
-    let repository = repository_name(repo_url)?;
+    let repository = repository_name(repo_url)
+        .map_err(|_| RepositoryConfigurationError("invalid repository URL"))?;
     sqlx::query_as!(RepositoryCredentials,
         "SELECT installation_id, repository_id, model_key_parameter FROM repository_credentials WHERE tenant_id = $1 AND repository = $2",
         tenant_id, repository
     ).fetch_optional(executor).await
         .context("reading tenant repository credential binding")?
-        .context("repository access has not been configured for this tenant")
+        .ok_or_else(|| RepositoryConfigurationError("repository not configured for tenant").into())
 }
 
 /// Values exist only in memory and encrypted Parameter Store, never task rows or scripts.

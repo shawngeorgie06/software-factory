@@ -101,7 +101,24 @@ pub struct SecretReference {
     pub region: String,
 }
 
+#[derive(Debug)]
+pub enum SecretConfigurationError {
+    Missing,
+    Invalid,
+}
+impl std::fmt::Display for SecretConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "configured secret does not exist",
+            Self::Invalid => "configured secret is invalid",
+        })
+    }
+}
+impl std::error::Error for SecretConfigurationError {}
+
 pub trait Cloud: Send + Sync {
+    /// Read-only readiness check. A later send can still race with a VM going offline.
+    fn script_ready(&self, instance_id: &str) -> impl Future<Output = anyhow::Result<bool>> + Send;
     fn read_secure(&self, name: &str) -> impl Future<Output = anyhow::Result<String>> + Send;
     fn put_task_secret(
         &self,

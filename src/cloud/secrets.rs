@@ -9,7 +9,7 @@ use aws_sdk_ssm::config::{retry::RetryConfig, timeout::TimeoutConfig};
 use aws_sdk_ssm::types::{ParameterStringFilter, ParameterTier, ParameterType, Tag};
 use uuid::Uuid;
 
-use super::StoredTaskSecret;
+use super::{SecretConfigurationError, StoredTaskSecret};
 
 pub struct ParameterStore {
     client: Client,
@@ -31,7 +31,7 @@ impl ParameterStore {
         let config = client
             .config()
             .to_builder()
-            .retry_config(RetryConfig::disabled())
+            .retry_config(RetryConfig::standard())
             .timeout_config(
                 TimeoutConfig::builder()
                     .connect_timeout(Duration::from_secs(3))
@@ -52,7 +52,9 @@ impl ParameterStore {
     /// Administrative configuration may live anywhere beneath `/factory/`, including
     /// outside this deployment. ARNs, version selectors and unrelated paths are rejected.
     pub async fn read_secure(&self, name: &str) -> Result<String> {
-        ensure!(valid_read_name(name), "invalid factory secret reference");
+        if !valid_read_name(name) {
+            return Err(SecretConfigurationError::Invalid.into());
+        }
         let output = self
             .client
             .get_parameter()
@@ -60,21 +62,28 @@ impl ParameterStore {
             .with_decryption(true)
             .send()
             .await
-            .map_err(|_| anyhow!("reading secure parameter failed"))?;
+            .map_err(|error| {
+                if error
+                    .as_service_error()
+                    .is_some_and(|e| e.is_parameter_not_found())
+                {
+                    anyhow::Error::from(SecretConfigurationError::Missing)
+                } else {
+                    anyhow!("reading secure parameter failed")
+                }
+            })?;
         let parameter = output
             .parameter()
             .ok_or_else(|| anyhow!("secure parameter response is missing"))?;
-        ensure!(
-            parameter.r#type() == Some(&ParameterType::SecureString),
-            "parameter must be a SecureString"
-        );
+        if parameter.r#type() != Some(&ParameterType::SecureString) {
+            return Err(SecretConfigurationError::Invalid.into());
+        }
         let value = parameter
             .value()
             .ok_or_else(|| anyhow!("secure parameter value is missing"))?;
-        ensure!(
-            !value.is_empty() && value.len() <= 8192,
-            "secure parameter value must contain 1-8192 bytes"
-        );
+        if value.is_empty() || value.len() > 8192 {
+            return Err(SecretConfigurationError::Invalid.into());
+        }
         Ok(value.to_owned())
     }
 
@@ -124,6 +133,10 @@ impl ParameterStore {
             .key_id(&self.kms_key_arn)
             .overwrite(false)
             .set_tags(Some(tags))
+            .customize()
+            .config_override(
+                aws_sdk_ssm::config::Builder::default().retry_config(RetryConfig::disabled()),
+            )
             .send()
             .await
             .map_err(|_| anyhow!("creating task secret failed; outcome may be uncertain"))?;
@@ -149,6 +162,7 @@ impl ParameterStore {
             let output = self
                 .client
                 .describe_parameters()
+                .max_results(50)
                 .parameter_filters(filter.clone())
                 .set_next_token(next_token)
                 .send()
@@ -490,7 +504,7 @@ mod tests {
         }
         assert_eq!(
             store.client.config().retry_config().unwrap().max_attempts(),
-            1
+            3
         );
         assert_eq!(
             store
@@ -562,6 +576,7 @@ mod tests {
         assert_eq!(secrets[0].tenant_id, Uuid::parse_str(TENANT).unwrap());
         assert_eq!(secrets[0].task_id, Uuid::parse_str(TASK).unwrap());
         let requests = server.join().unwrap();
+        assert!(requests[0].contains("\"MaxResults\":50"));
         assert!(requests[0].contains("\"Key\":\"Name\""));
         assert!(requests[0].contains("\"Option\":\"BeginsWith\""));
         assert!(requests[0].contains("/factory/test/tasks/"));
@@ -577,8 +592,8 @@ mod tests {
         store.delete_task(&task_name()).await.unwrap();
         assert!(server.join().unwrap()[0].contains("AmazonSSM.DeleteParameter"));
         let (store, server) = mock(vec![(
-            500,
-            "{\"__type\":\"InternalServerError\",\"message\":\"synthetic-private-body\"}".into(),
+            400,
+            "{\"__type\":\"ValidationException\",\"message\":\"synthetic-private-body\"}".into(),
         )]);
         let error = store.read_secure("/factory/admin/token").await.unwrap_err();
         assert_eq!(format!("{error:#}"), "reading secure parameter failed");

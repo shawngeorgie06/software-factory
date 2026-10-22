@@ -176,6 +176,33 @@ fn tag(key: &str, value: String) -> Tag {
 }
 
 impl Cloud for AwsCloud {
+    async fn script_ready(&self, instance_id: &str) -> anyhow::Result<bool> {
+        let filter = aws_sdk_ssm::types::InstanceInformationStringFilter::builder()
+            .key("InstanceIds")
+            .values(instance_id)
+            .build()
+            .map_err(|_| anyhow!("building SSM readiness filter failed"))?;
+        let output = self
+            .ssm
+            .describe_instance_information()
+            .filters(filter)
+            .customize()
+            .config_override(
+                aws_sdk_ssm::config::Builder::default().timeout_config(
+                    aws_sdk_ssm::config::timeout::TimeoutConfig::builder()
+                        .operation_timeout(std::time::Duration::from_secs(10))
+                        .build(),
+                ),
+            )
+            .send()
+            .await
+            .map_err(|_| anyhow!("checking SSM readiness failed"))?;
+        Ok(output.instance_information_list().iter().any(|info| {
+            info.instance_id() == Some(instance_id)
+                && info.ping_status() == Some(&aws_sdk_ssm::types::PingStatus::Online)
+        }))
+    }
+
     async fn read_secure(&self, name: &str) -> anyhow::Result<String> {
         self.parameters.read_secure(name).await
     }

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE tasks SET state = 'failed', failure_reason = $2, heartbeat_token_hash = NULL WHERE id = $1 AND state = 'running' AND agent_command_id IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "81b651610a247f10bd60d8daec5fcdb5fce84a14e8157fe1b129521a98497346"
+}

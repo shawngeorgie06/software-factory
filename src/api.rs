@@ -45,7 +45,8 @@ set -eu
 umask 077
 parameter={parameter}
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT HUP INT TERM
+trap 'rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
 aws ssm get-parameter --name "$parameter" --region {region} --with-decryption --query Parameter.Value --output text > "$work/credentials.json"
 python3 - "$work/credentials.json" "$work/headers" <<'FACTORY_PY'
 import datetime, json, re, sys
