@@ -9,10 +9,12 @@ use tracing_subscriber::EnvFilter;
 
 use factory::agent::AgentMode;
 use factory::api;
+use factory::api_keys;
 use factory::cloud::Cloud;
 use factory::cloud::aws::{AwsCloud, AwsCloudConfig};
 use factory::github::GitHubApp;
 use factory::reconciler::{Reconciler, ReconcilerConfig};
+use factory::tenant_api::{self, TaskApiConfig};
 
 fn required(name: &str) -> anyhow::Result<String> {
     std::env::var(name).with_context(|| format!("{name} must be set"))
@@ -28,14 +30,78 @@ fn optional_u64(name: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
+const USAGE: &str = "usage:
+  factory                                        run the API and reconciler
+  factory api-key create <tenant-uuid> <name>    print a new key (shown once)
+  factory api-key list <tenant-uuid>
+  factory api-key revoke <key-uuid>";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Logs go to stderr so stdout carries only command output, such as a new API key.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => serve().await,
+        Some("api-key") => api_key_command(&args[1..]).await,
+        Some(_) => anyhow::bail!("{USAGE}"),
+    }
+}
+
+/// Administrator key management. Needs only DATABASE_URL, not AWS settings.
+async fn api_key_command(args: &[String]) -> anyhow::Result<()> {
+    let parse_uuid =
+        |s: &str| uuid::Uuid::parse_str(s).with_context(|| format!("{s:?} is not a UUID"));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&required("DATABASE_URL")?)
+        .await
+        .context("connecting to Postgres")?;
+    factory::db::migrate(&pool).await?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        ["create", tenant, name] => {
+            let created = api_keys::create(&pool, parse_uuid(tenant)?, name).await?;
+            eprintln!(
+                "key id {}; store this key now, it is not shown again:",
+                created.id
+            );
+            println!("{}", created.key);
+        }
+        ["list", tenant] => {
+            for key in api_keys::list(&pool, parse_uuid(tenant)?).await? {
+                let show = |t: Option<chrono::DateTime<chrono::Utc>>| {
+                    t.map_or_else(|| "-".to_owned(), |t| t.to_rfc3339())
+                };
+                println!(
+                    "{}\t{}\tcreated {}\tlast used {}\trevoked {}",
+                    key.id,
+                    key.name,
+                    key.created_at.to_rfc3339(),
+                    show(key.last_used_at),
+                    show(key.revoked_at),
+                );
+            }
+        }
+        ["revoke", id] => {
+            anyhow::ensure!(
+                api_keys::revoke(&pool, parse_uuid(id)?).await?,
+                "no active key with id {id}"
+            );
+            eprintln!("revoked {id}");
+        }
+        _ => anyhow::bail!("{USAGE}"),
+    }
+    Ok(())
+}
+
+async fn serve() -> anyhow::Result<()> {
     let database_url = required("DATABASE_URL")?;
     let listen_addr =
         std::env::var("FACTORY_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
@@ -90,6 +156,26 @@ async fn main() -> anyhow::Result<()> {
     if matches!(reconciler_config.agent_mode, AgentMode::Codex { .. }) {
         factory::agent::validate_codex_url(&reconciler_config.agent_base_url)?;
     }
+    let task_api_config = TaskApiConfig {
+        default_ttl: Duration::from_secs(optional_u64("FACTORY_TASK_DEFAULT_TTL_SECS", 3600)?),
+        max_ttl: Duration::from_secs(optional_u64("FACTORY_TASK_MAX_TTL_SECS", 14400)?),
+        max_pending_per_tenant: i64::try_from(optional_u64(
+            "FACTORY_MAX_PENDING_TASKS_PER_TENANT",
+            50,
+        )?)
+        .context("FACTORY_MAX_PENDING_TASKS_PER_TENANT is too large")?,
+        require_repository_binding: matches!(reconciler_config.agent_mode, AgentMode::Codex { .. }),
+    };
+    anyhow::ensure!(
+        tenant_api::MIN_TTL <= task_api_config.default_ttl
+            && task_api_config.default_ttl <= task_api_config.max_ttl,
+        "FACTORY_TASK_DEFAULT_TTL_SECS must be at least {} and at most FACTORY_TASK_MAX_TTL_SECS",
+        tenant_api::MIN_TTL.as_secs()
+    );
+    anyhow::ensure!(
+        task_api_config.max_pending_per_tenant > 0,
+        "FACTORY_MAX_PENDING_TASKS_PER_TENANT must be greater than 0"
+    );
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -108,9 +194,16 @@ async fn main() -> anyhow::Result<()> {
     let api_pool = PgPoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_secs(5))
-        .connect_with(api_db_options)
+        .connect_with(api_db_options.clone())
         .await
         .context("connecting to Postgres for the agent API")?;
+    // Tenant traffic gets its own pool too, so busy clients can't starve agent reports.
+    let task_api_pool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(api_db_options)
+        .await
+        .context("connecting to Postgres for the task API")?;
 
     let cloud = AwsCloud::new(cloud_config).await?;
     let listener = TcpListener::bind(&listen_addr)
@@ -159,13 +252,14 @@ async fn main() -> anyhow::Result<()> {
         let _ = rx.changed().await;
     };
 
-    info!(%listen_addr, "agent API and reconciler starting");
+    info!(%listen_addr, "API and reconciler starting");
     let server_stop = stopped(stop_rx.clone());
     let server = async {
-        axum::serve(listener, api::router(api_pool))
+        let app = api::router(api_pool).merge(tenant_api::router(task_api_pool, task_api_config));
+        axum::serve(listener, app)
             .with_graceful_shutdown(server_stop)
             .await
-            .context("agent API server")
+            .context("API server")
     };
     let reconcile = async {
         reconciler.run(stopped(stop_rx)).await;

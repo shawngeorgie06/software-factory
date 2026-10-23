@@ -576,6 +576,37 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn cancelled_running_task_loses_its_vm_secret_and_token(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        r.tick().await.unwrap(); // start the agent
+        let scripts = cloud.scripts();
+        assert_eq!(scripts.len(), 1);
+        let token = token_in(&cloud, &scripts[0].script);
+        assert!(!cloud.list_task_secrets().await.unwrap().is_empty());
+
+        let cancelled = db::cancel_task(&pool, t.tenant_id, t.id).await.unwrap();
+        assert!(matches!(cancelled, db::Cancelled::Cancelled(_)));
+        assert!(!db::record_heartbeat(&pool, t.id, &token).await.unwrap());
+        assert!(
+            !db::record_result(&pool, t.id, &token, "late")
+                .await
+                .unwrap()
+        );
+
+        r.tick().await.unwrap();
+        assert!(
+            cloud.alive().is_empty(),
+            "cancelled task's VM is terminated"
+        );
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+        let t = task(&pool, t.id).await;
+        assert_eq!(t.state, TaskState::Failed);
+        assert_eq!(t.failure_reason.as_deref(), Some(db::CANCELLED_REASON));
+    }
+
+    #[sqlx::test]
     async fn orphans_are_terminated(pool: PgPool) {
         let cloud = Arc::new(FakeCloud::default());
         let no_task = cloud.insert_for_task(FakeState::Running, Uuid::new_v4(), Uuid::new_v4());
