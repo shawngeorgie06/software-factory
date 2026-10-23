@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT count(*) AS \"n!\"\n        FROM tasks\n        WHERE tenant_id = $1 AND state NOT IN ('succeeded', 'failed') AND expires_at > now()\n        ",
+  "query": "\n        SELECT count(*) AS \"n!\"\n        FROM tasks\n        WHERE tenant_id = $1 AND state NOT IN ('succeeded', 'failed')\n          AND expires_at > statement_timestamp()\n        ",
   "describe": {
     "columns": [
       {
@@ -19,5 +19,5 @@
       null
     ]
   },
-  "hash": "be7b359da0217a03f757f936defe836f8e120d35cc7f261e0a66bb3150eb2681"
+  "hash": "f8a0a7b594f380fc5afad54313f7a4892be5b8bfc37392ac702d1595f320f676"
 }

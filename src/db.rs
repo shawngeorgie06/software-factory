@@ -435,10 +435,13 @@ pub enum Submitted {
     TooManyPending,
 }
 
-/// What an earlier submission under the same idempotency key means for `new`, if one exists.
+/// What an earlier submission under the same idempotency key means for a retry with this
+/// input, if one exists. The ttl is not part of the input compared.
 pub async fn replay<'e>(
     executor: impl sqlx::PgExecutor<'e>,
-    new: &NewTask<'_>,
+    tenant_id: Uuid,
+    repo_url: &str,
+    instructions: &str,
     key: &str,
 ) -> anyhow::Result<Option<Submitted>> {
     let existing = sqlx::query_as!(
@@ -450,14 +453,14 @@ pub async fn replay<'e>(
         FROM tasks
         WHERE tenant_id = $1 AND idempotency_key = $2
         "#,
-        new.tenant_id,
+        tenant_id,
         key,
     )
     .fetch_optional(executor)
     .await
     .context("looking up idempotency key")?;
     Ok(existing.map(|task| {
-        if task.repo_url == new.repo_url && task.instructions == new.instructions {
+        if task.repo_url == repo_url && task.instructions == instructions {
             Submitted::Existing(task)
         } else {
             Submitted::KeyReused
@@ -481,7 +484,8 @@ pub async fn submit_task(pool: &PgPool, submission: &Submission<'_>) -> anyhow::
     .context("taking submit lock")?;
 
     if let Some(key) = submission.idempotency_key
-        && let Some(replay) = replay(&mut *tx, new, key).await?
+        && let Some(replay) =
+            replay(&mut *tx, new.tenant_id, new.repo_url, new.instructions, key).await?
     {
         return Ok(replay);
     }
@@ -490,7 +494,8 @@ pub async fn submit_task(pool: &PgPool, submission: &Submission<'_>) -> anyhow::
         r#"
         SELECT count(*) AS "n!"
         FROM tasks
-        WHERE tenant_id = $1 AND state NOT IN ('succeeded', 'failed') AND expires_at > now()
+        WHERE tenant_id = $1 AND state NOT IN ('succeeded', 'failed')
+          AND expires_at > statement_timestamp()
         "#,
         new.tenant_id,
     )
@@ -845,6 +850,59 @@ mod tests {
                 .unwrap()
         );
         assert!(!record_result(&pool, task.id, "tok", "again").await.unwrap());
+    }
+
+    #[sqlx::test]
+    async fn tasks_expiring_while_a_submission_waits_free_their_slot(pool: PgPool) {
+        let tenant = Uuid::new_v4();
+        let task = create_test_task(&pool, tenant, in_one_hour())
+            .await
+            .unwrap();
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+            .bind(SUBMIT_LOCK_NAMESPACE)
+            .bind(tenant.to_string())
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let submitting = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let submission = Submission {
+                    task: NewTask {
+                        tenant_id: tenant,
+                        repo_url: "https://github.com/owner/repo",
+                        instructions: "x",
+                        expires_at: in_one_hour(),
+                    },
+                    idempotency_key: None,
+                    max_pending: 1,
+                };
+                submit_task(&pool, &submission).await.unwrap()
+            }
+        });
+        // Once the submission waits on the lock, its transaction has started.
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        sqlx::query("UPDATE tasks SET expires_at = clock_timestamp() WHERE id = $1")
+            .bind(task.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+
+        assert!(matches!(submitting.await.unwrap(), Submitted::Created(_)));
     }
 
     #[sqlx::test]

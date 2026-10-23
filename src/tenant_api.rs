@@ -275,6 +275,36 @@ async fn create(State(state): State<ApiState>, request: Request) -> Response {
     if let Err(message) = validate_input(&body) {
         return problem(StatusCode::UNPROCESSABLE_ENTITY, message);
     }
+    // A retry of an accepted submission must succeed even if the repository's binding or
+    // the ttl limits changed since, so answer replays before checking them.
+    if let Some(key) = idempotency_key {
+        match db::replay(
+            &state.pool,
+            tenant_id,
+            &body.repo_url,
+            &body.instructions,
+            key,
+        )
+        .await
+        {
+            Ok(Some(replay)) => return submitted(tenant_id, replay),
+            Ok(None) => {}
+            Err(error) => return internal_error(tenant_id, error),
+        }
+    }
+    if state.config.require_repository_binding {
+        match repository_ready(&state.pool, tenant_id, &body.repo_url).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return problem(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "repository is not configured for this tenant",
+                );
+            }
+            Err(error) => return internal_error(tenant_id, error),
+        }
+    }
+
     let ttl = match body.ttl_seconds.map(Duration::from_secs) {
         None => state.config.default_ttl,
         Some(ttl) if (MIN_TTL..=state.config.max_ttl).contains(&ttl) => ttl,
@@ -298,28 +328,6 @@ async fn create(State(state): State<ApiState>, request: Request) -> Response {
         instructions: &body.instructions,
         expires_at: Utc::now() + ttl,
     };
-    // A retry of an accepted submission must succeed even if the repository's binding
-    // changed since, so answer replays before checking it.
-    if let Some(key) = idempotency_key {
-        match db::replay(&state.pool, &new, key).await {
-            Ok(Some(replay)) => return submitted(tenant_id, replay),
-            Ok(None) => {}
-            Err(error) => return internal_error(tenant_id, error),
-        }
-    }
-    if state.config.require_repository_binding {
-        match repository_ready(&state.pool, tenant_id, &body.repo_url).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return problem(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "repository is not configured for this tenant",
-                );
-            }
-            Err(error) => return internal_error(tenant_id, error),
-        }
-    }
-
     let submission = Submission {
         task: new,
         idempotency_key,
@@ -741,6 +749,42 @@ mod tests {
         assert_ne!(theirs["id"], first["id"]);
         let (status, _, _) = submit(key.clone(), "one", "has space").await;
         assert_eq!(status, 400);
+    }
+
+    #[sqlx::test]
+    async fn replays_are_answered_after_the_ttl_limit_is_lowered(pool: PgPool) {
+        let key = key(&pool, Uuid::new_v4()).await;
+        let body = json!({ "repo_url": REPO, "instructions": "x", "ttl_seconds": 7200 });
+        async fn submit(client: &Client, key: &str, body: &Value) -> (u16, HeaderMap, Value) {
+            let request = client
+                .http
+                .post(format!("{}/v1/tasks", client.base))
+                .bearer_auth(key)
+                .header("Idempotency-Key", "abc")
+                .json(body);
+            client.send(request).await
+        }
+        let before = Client::start(pool.clone(), config()).await;
+        let (status, _, first) = submit(&before, &key, &body).await;
+        assert_eq!(status, 201);
+
+        let after = Client::start(
+            pool.clone(),
+            TaskApiConfig {
+                max_ttl: Duration::from_secs(3600),
+                ..config()
+            },
+        )
+        .await;
+        let (status, _, again) = submit(&after, &key, &body).await;
+        assert_eq!((status, &again["id"]), (200, &first["id"]));
+        let (status, _, _) = after
+            .create(
+                &key,
+                json!({ "repo_url": REPO, "instructions": "y", "ttl_seconds": 7200 }),
+            )
+            .await;
+        assert_eq!(status, 422, "new submissions still get the lowered limit");
     }
 
     #[sqlx::test]
