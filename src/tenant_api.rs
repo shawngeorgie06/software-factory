@@ -3,11 +3,13 @@
 //! Every request carries an API key (see [`crate::api_keys`]) that fixes the tenant; no
 //! request can name another tenant, and another tenant's task looks like a missing one.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -15,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::db::{self, Cancelled, NewTask, Submission, Submitted, Task, TaskState};
@@ -28,6 +30,8 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 255;
 pub const MIN_TTL: Duration = Duration::from_secs(300);
 const DEFAULT_PAGE: i64 = 50;
 const MAX_PAGE: i64 = 100;
+/// How long a submission waits behind the same tenant's earlier ones before giving up.
+const SUBMIT_QUEUE_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct TaskApiConfig {
@@ -44,6 +48,57 @@ pub struct TaskApiConfig {
 struct ApiState {
     pool: PgPool,
     config: TaskApiConfig,
+    submit_gates: SubmitGates,
+}
+
+/// Lets one submission per tenant at a time reach the database from this process. The
+/// advisory lock in [`db::submit_task`] already serialises them, but each waiter would hold a
+/// pooled connection, so one tenant's burst could starve everyone else's requests.
+#[derive(Clone, Default)]
+struct SubmitGates(Arc<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>);
+
+struct SubmitTurn {
+    gates: SubmitGates,
+    tenant_id: Uuid,
+    _turn: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl SubmitGates {
+    /// Waits for the tenant's turn; `None` if earlier submissions held it too long.
+    async fn enter(&self, tenant_id: Uuid) -> Option<SubmitTurn> {
+        let gate = {
+            let mut gates = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(gates.entry(tenant_id).or_default())
+        };
+        let turn = tokio::time::timeout(SUBMIT_QUEUE_WAIT, gate.lock_owned())
+            .await
+            .ok()?;
+        Some(SubmitTurn {
+            gates: self.clone(),
+            tenant_id,
+            _turn: turn,
+        })
+    }
+}
+
+impl Drop for SubmitTurn {
+    fn drop(&mut self) {
+        let mut gates = self
+            .gates
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only the map and this turn's guard hold the gate: nobody is waiting, so forget it.
+        if gates
+            .get(&self.tenant_id)
+            .is_some_and(|gate| Arc::strong_count(gate) <= 2)
+        {
+            gates.remove(&self.tenant_id);
+        }
+    }
 }
 
 pub fn router(pool: PgPool, config: TaskApiConfig) -> Router {
@@ -53,7 +108,11 @@ pub fn router(pool: PgPool, config: TaskApiConfig) -> Router {
         .route("/v1/tasks/{id}/cancel", post(cancel))
         // Room for the largest instructions once JSON-escaped (`\u00XX` is 6 bytes per byte).
         .layer(DefaultBodyLimit::max(7 * MAX_INSTRUCTIONS_BYTES))
-        .with_state(ApiState { pool, config })
+        .with_state(ApiState {
+            pool,
+            config,
+            submit_gates: SubmitGates::default(),
+        })
 }
 
 /// What tenants see of a task. VM and SSM identifiers stay internal.
@@ -107,8 +166,38 @@ fn not_found() -> Response {
 }
 
 fn internal_error(tenant_id: Uuid, error: anyhow::Error) -> Response {
+    if saturated(&error) {
+        warn!(%tenant_id, error = ?error, "task API database busy");
+        return busy();
+    }
     error!(%tenant_id, error = ?error, "task API request failed");
     problem(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+/// 503 with a hint to retry: the request was fine, the server is momentarily overloaded.
+fn busy() -> Response {
+    let mut response = problem(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server is busy; retry shortly",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+/// Whether a failure came from load rather than a fault: no free pooled connection, or a
+/// lock or statement timeout.
+fn saturated(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::PoolTimedOut) => true,
+            Some(sqlx::Error::Database(db)) => {
+                matches!(db.code().as_deref(), Some("55P03" | "57014"))
+            }
+            _ => false,
+        })
 }
 
 /// Resolves the caller's tenant from `Authorization: Bearer <key>`.
@@ -123,11 +212,17 @@ async fn tenant(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, Response>
     let key = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, key)| key.trim_start_matches(' '))
         .ok_or_else(unauthorized)?;
     match crate::api_keys::authenticate(&state.pool, key).await {
         Ok(Some(tenant_id)) => Ok(tenant_id),
         Ok(None) => Err(unauthorized()),
+        Err(error) if saturated(&error) => {
+            warn!(error = ?error, "API key lookup hit a busy database");
+            Err(busy())
+        }
         Err(error) => {
             error!(error = ?error, "API key lookup failed");
             Err(problem(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
@@ -144,17 +239,15 @@ struct CreateBody {
     ttl_seconds: Option<u64>,
 }
 
-async fn create(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    body: Result<axum::Json<CreateBody>, JsonRejection>,
-) -> Response {
-    // Authenticate before looking at the body, so unauthenticated callers learn nothing.
+async fn create(State(state): State<ApiState>, request: Request) -> Response {
+    // Authenticate before reading the body, so unauthenticated callers can't make the
+    // server buffer and parse it, and learn nothing from validation errors.
+    let headers = request.headers().clone();
     let tenant_id = match tenant(&state, &headers).await {
         Ok(tenant_id) => tenant_id,
         Err(response) => return response,
     };
-    let body = match body {
+    let body = match axum::Json::<CreateBody>::from_request(request, &state).await {
         Ok(axum::Json(body)) => body,
         Err(rejection) => return problem(rejection.status(), &rejection.body_text()),
     };
@@ -193,6 +286,24 @@ async fn create(
             );
         }
     };
+    let Ok(ttl) = chrono::Duration::from_std(ttl) else {
+        return internal_error(tenant_id, anyhow::anyhow!("ttl out of range"));
+    };
+    let new = NewTask {
+        tenant_id,
+        repo_url: &body.repo_url,
+        instructions: &body.instructions,
+        expires_at: Utc::now() + ttl,
+    };
+    // A retry of an accepted submission must succeed even if the repository's binding
+    // changed since, so answer replays before checking it.
+    if let Some(key) = idempotency_key {
+        match db::replay(&state.pool, &new, key).await {
+            Ok(Some(replay)) => return submitted(tenant_id, replay),
+            Ok(None) => {}
+            Err(error) => return internal_error(tenant_id, error),
+        }
+    }
     if state.config.require_repository_binding {
         match repository_ready(&state.pool, tenant_id, &body.repo_url).await {
             Ok(true) => {}
@@ -205,22 +316,24 @@ async fn create(
             Err(error) => return internal_error(tenant_id, error),
         }
     }
-    let Ok(ttl) = chrono::Duration::from_std(ttl) else {
-        return internal_error(tenant_id, anyhow::anyhow!("ttl out of range"));
-    };
 
     let submission = Submission {
-        task: NewTask {
-            tenant_id,
-            repo_url: &body.repo_url,
-            instructions: &body.instructions,
-            expires_at: Utc::now() + ttl,
-        },
+        task: new,
         idempotency_key,
         max_pending: state.config.max_pending_per_tenant,
     };
+    let Some(_turn) = state.submit_gates.enter(tenant_id).await else {
+        return busy();
+    };
     match db::submit_task(&state.pool, &submission).await {
-        Ok(Submitted::Created(task)) => {
+        Ok(outcome) => submitted(tenant_id, outcome),
+        Err(error) => internal_error(tenant_id, error),
+    }
+}
+
+fn submitted(tenant_id: Uuid, outcome: Submitted) -> Response {
+    match outcome {
+        Submitted::Created(task) => {
             info!(%tenant_id, task_id = %task.id, "task submitted");
             let location = format!("/v1/tasks/{}", task.id);
             let mut response = reply(StatusCode::CREATED, TaskView::from(task));
@@ -229,16 +342,15 @@ async fn create(
             }
             response
         }
-        Ok(Submitted::Existing(task)) => reply(StatusCode::OK, TaskView::from(task)),
-        Ok(Submitted::KeyReused) => problem(
+        Submitted::Existing(task) => reply(StatusCode::OK, TaskView::from(task)),
+        Submitted::KeyReused => problem(
             StatusCode::CONFLICT,
             "Idempotency-Key was already used for a different task",
         ),
-        Ok(Submitted::TooManyPending) => problem(
+        Submitted::TooManyPending => problem(
             StatusCode::TOO_MANY_REQUESTS,
             "too many queued or active tasks; wait for some to finish",
         ),
-        Err(error) => internal_error(tenant_id, error),
     }
 }
 
@@ -791,5 +903,110 @@ mod tests {
             )
             .await;
         assert_eq!(status, 201, "repository names match case-insensitively");
+
+        // A retried submission still replays after its binding is removed.
+        let retry = || {
+            client
+                .http
+                .post(format!("{}/v1/tasks", client.base))
+                .bearer_auth(&key)
+                .header("Idempotency-Key", "retry-1")
+                .json(&task_body("keyed"))
+        };
+        let (status, _, first) = client.send(retry()).await;
+        assert_eq!(status, 201);
+        sqlx::query("DELETE FROM repository_credentials WHERE tenant_id = $1")
+            .bind(tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _, again) = client.send(retry()).await;
+        assert_eq!(status, 200);
+        assert_eq!(again["id"], first["id"]);
+        assert_eq!(client.create(&key, task_body("new")).await.0, 422);
+    }
+
+    #[sqlx::test]
+    async fn authentication_precedes_reading_the_body(pool: PgPool) {
+        let client = Client::start(pool.clone(), config()).await;
+        let key = key(&pool, Uuid::new_v4()).await;
+        let oversized = "x".repeat(8 * MAX_INSTRUCTIONS_BYTES);
+        let request = |auth: Option<&str>| {
+            let mut request = client
+                .http
+                .post(format!("{}/v1/tasks", client.base))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(oversized.clone());
+            if let Some(auth) = auth {
+                request = request.header(header::AUTHORIZATION, auth);
+            }
+            request
+        };
+        assert_eq!(client.send(request(None)).await.0, 401);
+        assert_eq!(
+            client.send(request(Some(&format!("Bearer {key}")))).await.0,
+            413
+        );
+        // The scheme is case-insensitive (RFC 9110).
+        let (status, _, _) = client
+            .send(
+                client
+                    .http
+                    .post(format!("{}/v1/tasks", client.base))
+                    .header(header::AUTHORIZATION, format!("bearer {key}"))
+                    .json(&task_body("x")),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(
+            client.send(request(Some(&format!("Basic {key}")))).await.0,
+            401
+        );
+    }
+
+    #[sqlx::test]
+    async fn expired_tasks_do_not_count_against_the_cap(pool: PgPool) {
+        let client = Client::start(pool.clone(), config()).await;
+        let tenant = Uuid::new_v4();
+        let key = key(&pool, tenant).await;
+        for _ in 0..3 {
+            assert_eq!(client.create(&key, task_body("x")).await.0, 201);
+        }
+        assert_eq!(client.create(&key, task_body("x")).await.0, 429);
+        sqlx::query(
+            "UPDATE tasks SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 second' WHERE tenant_id = $1",
+        )
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(client.create(&key, task_body("x")).await.0, 201);
+    }
+
+    #[tokio::test]
+    async fn submit_gates_serialise_a_tenant_and_forget_idle_ones() {
+        let gates = SubmitGates::default();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let first = gates.enter(a).await.unwrap();
+        // Another tenant isn't held up.
+        drop(gates.enter(b).await.unwrap());
+        let waiter = tokio::spawn({
+            let gates = gates.clone();
+            async move { gates.enter(a).await.is_some() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "same tenant waits its turn");
+        drop(first);
+        assert!(waiter.await.unwrap());
+        assert!(gates.0.lock().unwrap().is_empty(), "idle gates are dropped");
+    }
+
+    #[test]
+    fn load_failures_are_reported_as_busy() {
+        assert!(saturated(
+            &anyhow::Error::new(sqlx::Error::PoolTimedOut).context("x")
+        ));
+        assert!(!saturated(&anyhow::Error::new(sqlx::Error::RowNotFound)));
+        assert!(!saturated(&anyhow::anyhow!("other")));
     }
 }

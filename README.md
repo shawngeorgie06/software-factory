@@ -58,7 +58,7 @@ curl -sS https://factory.example.com/v1/tasks \
 
 `repo_url` must be `https://github.com/<owner>/<repo>`. Instructions are limited to 64 KiB. `ttl_seconds` runs from 300 to `FACTORY_TASK_MAX_TTL_SECS` and defaults to `FACTORY_TASK_DEFAULT_TTL_SECS`; the reconciler terminates the VM when it expires. In Codex mode, a task's repository must already have a `repository_credentials` binding with checks, or submission returns `422`.
 
-Retrying with the same `Idempotency-Key` and input returns the original task with `200`. Reusing a key for different input returns `409`. Each tenant may have `FACTORY_MAX_PENDING_TASKS_PER_TENANT` queued or active tasks; more return `429`.
+Retrying with the same `Idempotency-Key` and input returns the original task with `200`. Reusing a key for different input returns `409`. Each tenant may have `FACTORY_MAX_PENDING_TASKS_PER_TENANT` queued or active tasks; more return `429`. A replay is matched on `repo_url` and `instructions` only; a different `ttl_seconds` is ignored. Replays are answered before the repository binding is checked, so a retry still succeeds after the binding changes. A tenant's submissions are handled one at a time; if the database is saturated or a submission waits more than 5 seconds behind the same tenant's earlier ones, the API returns `503` with `Retry-After`.
 
 Cancelling marks the task failed with reason `cancelled through the task API`. The next reconciler tick terminates its VM and deletes its credential bundle, and the agent's token stops working at once. A runner that is already publishing can still push its branch or open a PR before the VM stops.
 

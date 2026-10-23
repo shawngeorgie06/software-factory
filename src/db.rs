@@ -435,6 +435,36 @@ pub enum Submitted {
     TooManyPending,
 }
 
+/// What an earlier submission under the same idempotency key means for `new`, if one exists.
+pub async fn replay<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    new: &NewTask<'_>,
+    key: &str,
+) -> anyhow::Result<Option<Submitted>> {
+    let existing = sqlx::query_as!(
+        Task,
+        r#"
+        SELECT id, tenant_id, state AS "state: TaskState", vm_instance_id,
+               heartbeat_at, expires_at, created_at, updated_at,
+               repo_url, instructions, result, failure_reason, agent_command_id
+        FROM tasks
+        WHERE tenant_id = $1 AND idempotency_key = $2
+        "#,
+        new.tenant_id,
+        key,
+    )
+    .fetch_optional(executor)
+    .await
+    .context("looking up idempotency key")?;
+    Ok(existing.map(|task| {
+        if task.repo_url == new.repo_url && task.instructions == new.instructions {
+            Submitted::Existing(task)
+        } else {
+            Submitted::KeyReused
+        }
+    }))
+}
+
 /// Queues a tenant's task, enforcing its pending-task cap and idempotency key.
 pub async fn submit_task(pool: &PgPool, submission: &Submission<'_>) -> anyhow::Result<Submitted> {
     let new = &submission.task;
@@ -450,31 +480,10 @@ pub async fn submit_task(pool: &PgPool, submission: &Submission<'_>) -> anyhow::
     .await
     .context("taking submit lock")?;
 
-    if let Some(key) = submission.idempotency_key {
-        let existing = sqlx::query_as!(
-            Task,
-            r#"
-            SELECT id, tenant_id, state AS "state: TaskState", vm_instance_id,
-                   heartbeat_at, expires_at, created_at, updated_at,
-                   repo_url, instructions, result, failure_reason, agent_command_id
-            FROM tasks
-            WHERE tenant_id = $1 AND idempotency_key = $2
-            "#,
-            new.tenant_id,
-            key,
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .context("looking up idempotency key")?;
-        if let Some(task) = existing {
-            return Ok(
-                if task.repo_url == new.repo_url && task.instructions == new.instructions {
-                    Submitted::Existing(task)
-                } else {
-                    Submitted::KeyReused
-                },
-            );
-        }
+    if let Some(key) = submission.idempotency_key
+        && let Some(replay) = replay(&mut *tx, new, key).await?
+    {
+        return Ok(replay);
     }
 
     let pending = sqlx::query_scalar!(
@@ -515,7 +524,9 @@ pub async fn submit_task(pool: &PgPool, submission: &Submission<'_>) -> anyhow::
 }
 
 /// One page of a tenant's tasks, newest first. `before` is the id of the last task on the
-/// previous page; an id the tenant doesn't own yields an empty page.
+/// previous page; an id the tenant doesn't own yields an empty page. `created_at` is the
+/// inserting transaction's start time, so a task whose insert commits late can sort behind
+/// a page already served.
 pub async fn list_tasks(
     pool: &PgPool,
     tenant_id: Uuid,

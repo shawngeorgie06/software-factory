@@ -4,6 +4,7 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use tracing::warn;
 use uuid::Uuid;
 
 /// Prefix that makes leaked keys easy to recognise and scan for.
@@ -77,7 +78,7 @@ pub async fn revoke(pool: &PgPool, id: Uuid) -> anyhow::Result<bool> {
 }
 
 /// The tenant an unrevoked key belongs to. Records use at most once a minute, so busy
-/// clients don't turn every read into a write.
+/// clients don't turn every read into a write, and only on a best-effort basis.
 pub async fn authenticate(pool: &PgPool, key: &str) -> anyhow::Result<Option<Uuid>> {
     if !well_formed(key) {
         return Ok(None);
@@ -97,13 +98,16 @@ pub async fn authenticate(pool: &PgPool, key: &str) -> anyhow::Result<Option<Uui
         .last_used_at
         .is_none_or(|used| used < Utc::now() - chrono::Duration::minutes(1))
     {
-        sqlx::query!(
+        // Bookkeeping only: a failure here must not reject a valid key.
+        if let Err(error) = sqlx::query!(
             "UPDATE api_keys SET last_used_at = now() WHERE id = $1",
             row.id
         )
         .execute(pool)
         .await
-        .context("recording API key use")?;
+        {
+            warn!(key_id = %row.id, error = ?error, "recording API key use failed");
+        }
     }
     Ok(Some(row.tenant_id))
 }
@@ -147,6 +151,35 @@ mod tests {
         assert!(revoke(&pool, created.id).await.unwrap());
         assert!(!revoke(&pool, created.id).await.unwrap());
         assert_eq!(authenticate(&pool, &created.key).await.unwrap(), None);
+    }
+
+    #[sqlx::test]
+    async fn use_is_recorded_at_most_once_a_minute(pool: PgPool) {
+        let created = create(&pool, Uuid::new_v4(), "ci").await.unwrap();
+        let last_used = || {
+            sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT last_used_at FROM api_keys WHERE id = $1",
+            )
+            .bind(created.id)
+            .fetch_one(&pool)
+        };
+        authenticate(&pool, &created.key).await.unwrap();
+        let first = last_used().await.unwrap();
+        assert!(first.is_some());
+        authenticate(&pool, &created.key).await.unwrap();
+        assert_eq!(
+            last_used().await.unwrap(),
+            first,
+            "recent use isn't rewritten"
+        );
+
+        sqlx::query("UPDATE api_keys SET last_used_at = now() - interval '2 minutes'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale = last_used().await.unwrap();
+        authenticate(&pool, &created.key).await.unwrap();
+        assert!(last_used().await.unwrap() > stale, "stale use is refreshed");
     }
 
     #[sqlx::test]
