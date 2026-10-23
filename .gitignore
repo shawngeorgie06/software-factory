@@ -5,3 +5,5 @@
 *.pem
 !tests/fixtures/github/test-private.pem
 !tests/fixtures/github/test-public.pem
+
+__pycache__/

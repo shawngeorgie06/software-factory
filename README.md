@@ -2,11 +2,11 @@
 
 Rust orchestrator for task-scoped EC2 VMs. Postgres owns task state; a reconciler launches and cleans up instances through the `Cloud` trait. VMs accept commands through SSM with no inbound network access.
 
-Milestones 1–3 provide task storage, reconciliation, and a heartbeat/`hello` round trip. Milestone 4 adds encrypted credential delivery and repository-scoped GitHub App tokens. The coding agent, PR creation, verification stage, deployment, and monitoring are later milestones.
+Milestones 1–3 provide task storage, reconciliation, and a heartbeat/`hello` round trip. Milestone 4 adds encrypted credential delivery and repository-scoped GitHub App tokens. Milestone 5 adds a Codex CLI runner, administrator-configured verification, and task-branch PR creation. Deployment and monitoring are later milestones.
 
 ## Test locally
 
-Use Rust stable, PostgreSQL 16, Python 3, and curl. Tests use FakeCloud and local HTTP servers; they do not call AWS or GitHub.
+Use Rust stable, PostgreSQL 16, Python 3.9 or newer, git, and curl. Tests use FakeCloud, local HTTP servers, and temporary Git repositories; they do not call AWS, GitHub, or a model API.
 
 ```sh
 docker compose up -d postgres
@@ -14,6 +14,7 @@ cp .env.example .env
 set -a
 . ./.env
 set +a
+python3 -m unittest discover -s vm -p 'test_*.py'
 SQLX_OFFLINE=true cargo test --locked
 SQLX_OFFLINE=true cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -36,7 +37,7 @@ The following setup is for the operator. Running the orchestrator creates billab
 2. Create a symmetric customer-managed KMS key in the VM region. Set `FACTORY_SECRETS_KMS_KEY_ARN` to its full key ARN. The orchestrator needs `kms:Encrypt` and `kms:Decrypt` through SSM.
 3. Grant the orchestrator `ssm:PutParameter`, `ssm:AddTagsToResource`, and `ssm:DeleteParameter` on `/factory/DEPLOYMENT/tasks/*`. Grant `ssm:GetParameter` on the control key and the configured tenant model keys. `ssm:DescribeParameters` requires `Resource: "*"`; it lists metadata, not secret values. Grant `ssm:DescribeInstanceInformation` for the readiness check. Keep the existing EC2, SSM Run Command, and `iam:PassRole` permissions.
 4. Restrict the VM instance role with [the policy template](docs/vm-secret-policy.json). Replace `REGION`, `ACCOUNT_ID`, `DEPLOYMENT`, and `KMS_KEY_ID`. Keep `${ec2:SourceInstanceARN}` unchanged: IAM substitutes the calling VM's ARN. The template is for the standard `aws` partition. It must accompany the existing SSM agent permissions.
-5. Ensure the AMI has AWS CLI v2, Python 3, curl, SSM Agent, and cloud-init. VMs need outbound HTTPS to SSM, KMS through SSM, and the callback API. GitHub access will also be needed by the later coding agent.
+5. Ensure the AMI has AWS CLI v2, Python 3, curl, SSM Agent, and cloud-init. VMs need outbound HTTPS to SSM, KMS through SSM, and the callback API. Codex mode also requires outbound HTTPS to GitHub and the OpenAI API.
 
 The explicit denies in the template are required: `AmazonSSMManagedInstanceCore` already grants broad `GetParameter` and `GetParameters` access. The denies prevent access to other VMs' bundles and control secrets, and block history/path reads. Do not grant VMs parameter writes, tag changes, permission changes, or the orchestrator role. A task bundle is tagged with the exact owning instance ARN.
 
@@ -75,9 +76,43 @@ The reconciler checks SSM readiness and task expiry before minting credentials. 
 
 A failed or timed-out send rolls back the callback-token hash, so an abandoned run cannot report successfully. The next attempt gets a new bundle. The reconciler lists bundle metadata and deletes bundles for finished, expired, or missing tasks, including puts accepted just before a crash. VM termination runs before the secret sweep. Delete failures retry on later ticks. A definite SSM rejection deletes its unused bundle immediately. Bundles from uncertain sends remain until the task finishes. GitHub tokens already minted during an uncertain send or a readiness race expire naturally; this milestone does not revoke them.
 
-Parameter Store does not enforce the task's expiry as a revocation deadline. Cleanup requires a running orchestrator. Deleting a bundle cannot revoke a secret already read by the VM. GitHub installation tokens expire after roughly one hour; model keys remain tenant credentials and need provider-side limits and rotation. This milestone does not refresh or revoke GitHub tokens or run repository code. Use short tasks during initial testing. VM root can read its own credentials; do not grant that VM access to other tasks.
+Parameter Store does not enforce the task's expiry as a revocation deadline. Cleanup requires a running orchestrator. Deleting a bundle cannot revoke a secret already read by the VM. GitHub installation tokens expire after roughly one hour; model keys remain tenant credentials and need provider-side limits and rotation. The runner does not refresh or revoke GitHub tokens; it stops before the installation token expires. Use short tasks during initial testing. VM root can read its own credentials; do not grant that VM access to other tasks.
 
-The API is still the milestone-3 callback API. Tasks are created through the database, and successful hello results go directly to `succeeded`; `verifying` remains reserved. Real AWS launch, SSM registration, IAM/KMS isolation, and self-shutdown must be tested by the operator before customer workloads.
+Tasks are still created through the database. Real AWS launch, SSM registration, IAM/KMS isolation, and self-shutdown must be tested by the operator before customer workloads.
+
+## Run coding tasks with Codex
+
+The default `FACTORY_AGENT_MODE=hello` preserves the smoke test. To enable coding, set `FACTORY_AGENT_MODE=codex` and `FACTORY_CODEX_MODEL` to an explicit model ID enabled for your OpenAI API key. Both GitHub App settings and a dedicated HTTPS callback origin on port 443 (no path prefix) are required. Store the OpenAI API key in the bound tenant model-key SecureString.
+
+Apply the new migration and configure a verification command on each repository binding. Existing bindings have no check command and fail closed in Codex mode. This is administrator-managed argv, not task-provided shell text:
+
+```sql
+UPDATE repository_credentials
+SET check_command = ARRAY['env', 'CARGO_HOME=/opt/factory/cargo', 'cargo', 'test', '--locked', '--offline']
+WHERE tenant_id = '00000000-0000-0000-0000-000000000001'
+  AND repository = 'owner/repository';
+```
+
+Prepare a Linux AMI with Python 3.9+, Git, a pinned Codex CLI supporting `exec --ephemeral --ignore-user-config --ignore-rules`, AWS CLI v2, `setpriv`, `unshare`, `mount`, `pkill`, `iptables`, and `ip6tables`. Install toolchains system-wide on `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` and prepopulate dependencies in an administrator-owned, agent-read-only cache. The Cargo example assumes a system Cargo/Rust installation and `/opt/factory/cargo` cache; per-user rustup installations are not on the runner's PATH. Verification receives a fresh HOME and no network access. Create a dedicated `factory-agent` account with a nonzero UID/GID, home `/home/factory-agent`, and no sudo or privileged groups. Root must be able to create mount/network namespaces and tmpfs mounts. Deny cron, at, and systemd user lingering for this account so it cannot schedule processes outside the runner. One task owns that UID and VM; the runner terminates its remaining processes after each code/check phase. SSM runs the trusted bootstrap as root. Do not enable this mode on a shared host.
+
+Before runners start, provision root-owned storage and persist these metadata firewall rules. They must be the first rule in each OUTPUT chain; the runner checks the exact rules and verifies metadata connections fail under the agent UID. IMDSv2 alone does not isolate local processes.
+
+```sh
+install -d -o root -g root -m 0711 /var/lib/software-factory
+factory_uid="$(id -u factory-agent)"
+iptables -w 5 -I OUTPUT 1 -d 169.254.169.254/32 -m owner --uid-owner "$factory_uid" -j REJECT --reject-with icmp-port-unreachable
+ip6tables -w 5 -I OUTPUT 1 -d fd00:ec2::254/128 -m owner --uid-owner "$factory_uid" -j REJECT --reject-with icmp6-port-unreachable
+```
+
+Use the AMI's firewall persistence mechanism and verify both rules survive reboot before accepting tasks. For an AMI with `netfilter-persistent`, run `netfilter-persistent save` and enable that service. The runner checks host isolation before loading credentials; a misconfigured host never reaches repository or model execution. The operator must verify actual firewall, namespace and sandbox enforcement on the prepared AMI.
+
+The runner first authenticates a heartbeat, then fetches the task's repository, instructions, and configured checks. It clones the default branch, runs Codex as `factory-agent` with workspace-write sandboxing and tool network access disabled, freezes the resulting Git tree, and enters `verifying`. Checks run against a separate checkout of that frozen tree. Only a passing tree is pushed to `factory/task-TASK_UUID`, followed by a PR against the repository's default branch. Existing conflicting task branches are refused. A no-change task still runs checks and succeeds without a push or PR. The result records status, branch, commit, and PR URL, distinguishing newly created, existing open, and already closed PRs; failures expose only a fixed phase label.
+
+GitHub and callback credentials stay in the root runner. Only the Codex invocation receives `CODEX_API_KEY`; verification receives no credentials. Each invocation gets private `/tmp`, `/var/tmp`, `/dev/shm`, and account-home mounts; checks also cannot read the model HOME. Publishing uses a separate root-owned Git directory, ignores repository hooks/configuration, and checks staged files for literal credentials. Symlinks, hardlinks, submodules, nested Git metadata, and oversized trees/files are rejected (16 MiB per file, 256 MiB per tree, and 100,000 entries). Repository or ancestor `.codex` configuration is also rejected before invoking Codex. Repositories requiring these features are not supported by this milestone. These controls do not make arbitrary repository code safe against kernel or sandbox vulnerabilities; use disposable, isolated task VMs.
+
+Heartbeats continue during work. Any routine heartbeat failure, including a temporary network or server failure, aborts the run; this conservative policy favors stopping work when authorization cannot be confirmed. Task expiry or the GitHub token's expiry margin also stops work. Transient admission and final-result requests retry within the lease deadline; the 30-second freshness bound may shorten that retry budget. The authenticated callback API now includes `GET /v1/tasks/{id}/assignment` and `POST` endpoints for `heartbeat`, `verifying`, `result`, and `failure`. Successful coding tasks move through `running → verifying → succeeded`; failures become terminal `failed` tasks for reconciler cleanup.
+
+Local tests exercise mocked credential/model/GitHub transport and real temporary Git repositories. Linux privilege dropping, network namespaces, the installed Codex sandbox, and real cloud/provider access remain operator acceptance checks on the prepared AMI; local tests do not claim those live checks passed. Exercise the exact offline check command on the AMI, including Cargo cache locking, and verify that SSM accepts the embedded command payload.
 
 ## References
 

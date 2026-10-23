@@ -6,8 +6,9 @@
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::routing::post;
-use serde::Deserialize;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
@@ -21,6 +22,9 @@ pub fn router(pool: PgPool) -> Router {
     Router::new()
         .route("/v1/tasks/{id}/heartbeat", post(heartbeat))
         .route("/v1/tasks/{id}/result", post(result))
+        .route("/v1/tasks/{id}/assignment", get(assignment))
+        .route("/v1/tasks/{id}/verifying", post(verifying))
+        .route("/v1/tasks/{id}/failure", post(failure))
         // Room for the largest result once JSON-escaped (`\u00XX` is 6 bytes per byte).
         .layer(DefaultBodyLimit::max(7 * MAX_RESULT_BYTES))
         .with_state(pool)
@@ -59,7 +63,7 @@ if not re.fullmatch(r"[0-9a-f]{{64}}", token) or expiry <= datetime.datetime.now
 with open(sys.argv[2], "w") as f:
     f.write("Authorization: Bearer " + token + "\n")
 FACTORY_PY
-# The later coding-agent milestone will consume the remaining bundle fields here.
+# Hello mode provides a small credential-delivery smoke test.
 task_url={task_url}
 post() {{ curl -fsS --retry 5 --retry-all-errors --max-time 30 -X POST -H "@$work/headers" "$@"; }}
 post "$task_url/heartbeat"
@@ -109,6 +113,94 @@ async fn heartbeat(
         Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => StatusCode::NOT_FOUND,
         Err(e) => internal_error(id, e),
+    }
+}
+
+#[derive(Serialize)]
+struct Assignment {
+    repo_url: String,
+    instructions: String,
+    check_command: Vec<String>,
+}
+
+async fn assignment(
+    State(pool): State<PgPool>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    let (id, token) = authenticate(&id, &headers)?;
+    let input = db::agent_input(&pool, id, token)
+        .await
+        .map_err(|error| internal_error(id, error))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if input.instructions.len() > 65536 || input.repo_url.len() > 2048 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let binding = crate::credentials::for_task(&pool, input.tenant_id, &input.repo_url)
+        .await
+        .map_err(|error| {
+            if error.is::<crate::credentials::RepositoryConfigurationError>() {
+                StatusCode::NOT_FOUND
+            } else {
+                internal_error(id, error)
+            }
+        })?;
+    let checks = crate::credentials::validate_checks(binding.check_command.as_deref())
+        .map_err(|_| StatusCode::CONFLICT)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(Assignment {
+            repo_url: input.repo_url,
+            instructions: input.instructions,
+            check_command: checks.to_vec(),
+        }),
+    ))
+}
+
+async fn verifying(
+    State(pool): State<PgPool>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> StatusCode {
+    let (id, token) = match authenticate(&id, &headers) {
+        Ok(auth) => auth,
+        Err(status) => return status,
+    };
+    match db::record_verifying(&pool, id, token).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(error) => internal_error(id, error),
+    }
+}
+
+#[derive(Deserialize)]
+struct FailureBody {
+    reason: String,
+}
+
+async fn failure(
+    State(pool): State<PgPool>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Result<axum::Json<FailureBody>, axum::extract::rejection::JsonRejection>,
+) -> StatusCode {
+    let (id, token) = match authenticate(&id, &headers) {
+        Ok(auth) => auth,
+        Err(status) => return status,
+    };
+    let Ok(axum::Json(body)) = body else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if body.reason.is_empty()
+        || body.reason.len() > 1024
+        || body.reason.chars().any(char::is_control)
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    match db::record_failure(&pool, id, token, &body.reason).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(error) => internal_error(id, error),
     }
 }
 
@@ -418,5 +510,152 @@ mod tests {
             assert!(done.result.is_none());
             assert_eq!(done.heartbeat_at, before.heartbeat_at);
         }
+    }
+    async fn bind_checks(pool: &PgPool, task: &Task) {
+        sqlx::query("UPDATE tasks SET repo_url = 'https://github.com/owner/repo', instructions = $2 WHERE id = $1")
+            .bind(task.id).bind("fix the test; $(do not execute as shell)").execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO repository_credentials (tenant_id, repository, installation_id, repository_id, model_key_parameter, check_command) VALUES ($1, 'owner/repo', 11, 22, $2, $3)")
+            .bind(task.tenant_id).bind(format!("/factory/test/tenants/{}/model-key", task.tenant_id)).bind(vec!["cargo", "test", "--locked"]).execute(pool).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn assignment_is_authenticated_and_uses_admin_configured_checks(pool: PgPool) {
+        let token = new_agent_token();
+        let task = running_task(&pool, &token).await;
+        bind_checks(&pool, &task).await;
+        let addr = serve(pool.clone()).await;
+        let url = format!("http://{addr}/v1/tasks/{}/assignment", task.id);
+        let client = reqwest::Client::new();
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("wrong")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        let response = client.get(&url).bearer_auth(&token).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let value: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            value["check_command"],
+            serde_json::json!(["cargo", "test", "--locked"])
+        );
+        assert_eq!(
+            value["instructions"],
+            "fix the test; $(do not execute as shell)"
+        );
+        assert!(value.get("model_api_key").is_none());
+        sqlx::query("DELETE FROM repository_credentials WHERE tenant_id = $1")
+            .bind(task.tenant_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+    }
+
+    #[sqlx::test]
+    async fn verification_failure_is_terminal_and_authentication_still_applies(pool: PgPool) {
+        let token = new_agent_token();
+        let task = running_task(&pool, &token).await;
+        let addr = serve(pool.clone()).await;
+        let path = format!("/v1/tasks/{}", task.id);
+        assert_eq!(
+            post(&addr, &format!("{path}/verifying"), None, "").await,
+            401
+        );
+        assert_eq!(
+            post(&addr, &format!("{path}/verifying"), Some("wrong"), "").await,
+            404
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                post(&addr, &format!("{path}/verifying"), Some(&token), "").await,
+                204
+            );
+        }
+        assert_eq!(reload(&pool, &task).await.state, TaskState::Verifying);
+        assert_eq!(
+            post(&addr, &format!("{path}/heartbeat"), Some(&token), "").await,
+            204
+        );
+        assert_eq!(
+            post(
+                &addr,
+                &format!("{path}/failure"),
+                Some(&token),
+                r#"{"reason":"checks failed"}"#
+            )
+            .await,
+            204
+        );
+        let failed = reload(&pool, &task).await;
+        assert_eq!(failed.state, TaskState::Failed);
+        assert_eq!(failed.failure_reason.as_deref(), Some("checks failed"));
+        assert_eq!(
+            post(
+                &addr,
+                &format!("{path}/result"),
+                Some(&token),
+                r#"{"result":"late success"}"#
+            )
+            .await,
+            404
+        );
+        assert_eq!(
+            post(&addr, &format!("{path}/verifying"), Some(&token), "").await,
+            404
+        );
+    }
+
+    #[sqlx::test]
+    async fn agent_failures_validate_bodies_and_expiry(pool: PgPool) {
+        let token = new_agent_token();
+        let task = running_task(&pool, &token).await;
+        bind_checks(&pool, &task).await;
+        let addr = serve(pool.clone()).await;
+        let path = format!("/v1/tasks/{}", task.id);
+        for reason in [String::new(), "x".repeat(1025), "bad\nreason".into()] {
+            let body = serde_json::json!({"reason":reason}).to_string();
+            assert_eq!(
+                post(&addr, &format!("{path}/failure"), Some(&token), &body).await,
+                400
+            );
+        }
+        sqlx::query("UPDATE tasks SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 hour' WHERE id = $1").bind(task.id).execute(&pool).await.unwrap();
+        assert_eq!(
+            post(
+                &addr,
+                &format!("{path}/failure"),
+                Some(&token),
+                r#"{"reason":"late failure"}"#
+            )
+            .await,
+            404
+        );
+        assert_eq!(
+            post(&addr, &format!("{path}/verifying"), Some(&token), "").await,
+            404
+        );
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}{path}/assignment"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
     }
 }

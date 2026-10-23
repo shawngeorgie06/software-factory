@@ -11,6 +11,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::agent::{self, AgentMode};
 use crate::api;
 use crate::cloud::{Cloud, Instance, InstanceState, LaunchRequest, ScriptRequest, ScriptStart};
 use crate::credentials::{self, RepositoryTokenIssuer, TaskCredentials};
@@ -20,6 +21,7 @@ use crate::github::{GitHubApp, InstallationToken};
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
     pub deployment: String,
+    pub agent_mode: AgentMode,
     pub interval: Duration,
     /// A launching/running/verifying task with no heartbeat for this long is failed.
     pub heartbeat_timeout: Duration,
@@ -223,7 +225,14 @@ impl<C: Cloud, G: RepositoryTokenIssuer> Reconciler<C, G> {
             .cloud
             .put_task_secret(task.tenant_id, task.id, instance_id, &value)
             .await?;
-        let script = api::hello_agent_script(&self.config.agent_base_url, task.id, &parameter);
+        let script = match &self.config.agent_mode {
+            AgentMode::Hello => {
+                api::hello_agent_script(&self.config.agent_base_url, task.id, &parameter)
+            }
+            AgentMode::Codex { model } => {
+                agent::codex_script(&self.config.agent_base_url, task.id, &parameter, model)
+            }
+        };
         let timeout = (task.expires_at - chrono::Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
@@ -260,10 +269,29 @@ impl<C: Cloud, G: RepositoryTokenIssuer> Reconciler<C, G> {
         task: &Task,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> anyhow::Result<Option<RepositoryAccess>> {
+        if matches!(self.config.agent_mode, AgentMode::Codex { .. })
+            && (task.instructions.trim().is_empty()
+                || task.instructions.len() > 65536
+                || task.instructions.contains('\0'))
+        {
+            return Err(credentials::RepositoryConfigurationError(
+                "invalid coding task instructions",
+            )
+            .into());
+        }
         let Some(github) = &self.github else {
+            if matches!(self.config.agent_mode, AgentMode::Codex { .. }) {
+                return Err(credentials::RepositoryConfigurationError(
+                    "codex mode requires GitHub App credentials",
+                )
+                .into());
+            }
             return Ok(None);
         };
         let binding = credentials::for_task(&mut **tx, task.tenant_id, &task.repo_url).await?;
+        if matches!(self.config.agent_mode, AgentMode::Codex { .. }) {
+            credentials::validate_checks(binding.check_command.as_deref())?;
+        }
         let prefix = format!(
             "/factory/{}/tenants/{}/",
             self.config.deployment, task.tenant_id
@@ -451,6 +479,7 @@ mod tests {
             Arc::clone(cloud),
             ReconcilerConfig {
                 deployment: DEPLOYMENT.into(),
+                agent_mode: AgentMode::Hello,
                 interval: Duration::from_secs(5),
                 heartbeat_timeout: Duration::from_secs(HEARTBEAT_TIMEOUT_SECS as u64),
                 max_launches_per_tick: MAX_LAUNCHES,
@@ -1168,6 +1197,84 @@ mod tests {
         );
         r.tick().await.unwrap();
         assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn codex_rejects_invalid_instructions_before_credentials(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let mut r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        r.config.agent_mode = AgentMode::Codex {
+            model: "configured-model".into(),
+        };
+        sqlx::query("UPDATE tasks SET instructions = $2 WHERE id = $1")
+            .bind(t.id)
+            .bind("x".repeat(65537))
+            .execute(&pool)
+            .await
+            .unwrap();
+        r.with_github(FakeGithub).tick().await.unwrap();
+        assert!(cloud.scripts().is_empty());
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+        assert_eq!(
+            task(&pool, t.id).await.failure_reason.as_deref(),
+            Some("invalid coding task instructions")
+        );
+    }
+
+    #[sqlx::test]
+    async fn codex_dispatch_requires_checks_and_keeps_input_out_of_ssm(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        for configured in [false, true] {
+            let mut r = reconciler(&pool, &cloud);
+            let t = running_without_agent(&pool, &r, &cloud).await;
+            r.config.agent_mode = AgentMode::Codex {
+                model: "configured-model".into(),
+            };
+            sqlx::query("UPDATE tasks SET repo_url = 'https://github.com/owner/repo', instructions = 'UNTRUSTED_TASK_INPUT' WHERE id = $1")
+                .bind(t.id).execute(&pool).await.unwrap();
+            let name = format!("/factory/{DEPLOYMENT}/tenants/{}/model-key", t.tenant_id);
+            sqlx::query("INSERT INTO repository_credentials (tenant_id, repository, installation_id, repository_id, model_key_parameter, check_command) VALUES ($1, 'owner/repo', 11, 22, $2, $3)")
+                .bind(t.tenant_id).bind(&name)
+                .bind(configured.then(|| vec!["cargo".to_string(), "test".to_string(), "--locked".to_string()]))
+                .execute(&pool).await.unwrap();
+            cloud.set_source_secret(&name, "synthetic-model-key");
+            r.with_github(FakeGithub).tick().await.unwrap();
+            if configured {
+                let script = &cloud.scripts()[0].script;
+                assert!(script.contains("--model 'configured-model'"));
+                assert!(script.contains("class Runner:"));
+                assert!(!script.contains("UNTRUSTED_TASK_INPUT"));
+                let stored = cloud.list_task_secrets().await.unwrap();
+                let credentials: serde_json::Value =
+                    serde_json::from_str(&cloud.secret_value(&stored[0].name)).unwrap();
+                for key in ["github_token", "model_api_key", "callback_token"] {
+                    assert!(!script.contains(credentials[key].as_str().unwrap()));
+                }
+                assert!(
+                    db::record_heartbeat(
+                        &pool,
+                        t.id,
+                        credentials["callback_token"].as_str().unwrap()
+                    )
+                    .await
+                    .unwrap()
+                );
+            } else {
+                assert!(cloud.scripts().is_empty());
+                assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+                assert_eq!(
+                    task(&pool, t.id).await.failure_reason.as_deref(),
+                    Some("repository checks are not configured")
+                );
+            }
+            // Finish this iteration before testing the next configuration.
+            sqlx::query("UPDATE tasks SET state = 'failed' WHERE id = $1")
+                .bind(t.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 
     #[sqlx::test]

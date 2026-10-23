@@ -13,8 +13,7 @@ pub enum TaskState {
     Queued,
     Launching,
     Running,
-    /// Reserved for checking an agent's result before accepting it. Nothing enters it yet:
-    /// a reported result currently goes straight to `Succeeded`.
+    /// The VM runner is checking the frozen code snapshot before publishing it.
     Verifying,
     Succeeded,
     Failed,
@@ -345,8 +344,44 @@ pub async fn record_heartbeat(pool: &PgPool, id: Uuid, token: &str) -> anyhow::R
     Ok(result.rows_affected() == 1)
 }
 
+pub struct AgentInput {
+    pub tenant_id: Uuid,
+    pub repo_url: String,
+    pub instructions: String,
+}
+
+/// Only the current, unexpired run can obtain task input. Tenant scope comes from that row.
+pub async fn agent_input(
+    pool: &PgPool,
+    id: Uuid,
+    token: &str,
+) -> anyhow::Result<Option<AgentInput>> {
+    sqlx::query_as!(AgentInput, "SELECT tenant_id, repo_url, instructions FROM tasks WHERE id = $1 AND heartbeat_token_hash = sha256(convert_to($2, 'UTF8')) AND state IN ('running', 'verifying') AND expires_at > now()", id, token)
+        .fetch_optional(pool).await.context("reading agent assignment")
+}
+
+/// Idempotent transition into verification, authenticated exactly like a heartbeat.
+pub async fn record_verifying(pool: &PgPool, id: Uuid, token: &str) -> anyhow::Result<bool> {
+    let result = sqlx::query!("UPDATE tasks SET state = 'verifying', heartbeat_at = now() WHERE id = $1 AND heartbeat_token_hash = sha256(convert_to($2, 'UTF8')) AND state IN ('running', 'verifying') AND expires_at > now()", id, token)
+        .execute(pool).await.context("recording verification start")?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Failed agent/check runs become terminal and are collected by the reconciler.
+pub async fn record_failure(
+    pool: &PgPool,
+    id: Uuid,
+    token: &str,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query!("UPDATE tasks SET state = 'failed', failure_reason = $3, heartbeat_at = now() WHERE id = $1 AND heartbeat_token_hash = sha256(convert_to($2, 'UTF8')) AND state IN ('running', 'verifying') AND expires_at > now()", id, token, reason)
+        .execute(pool).await.context("recording agent failure")?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Marks the task succeeded with the agent's result, under the same conditions as
-/// [`record_heartbeat`]. The reconciler then terminates its VM.
+/// [`record_heartbeat`]. An exact authenticated retry is acknowledged without changing the result.
+/// The reconciler then terminates its VM.
 pub async fn record_result(
     pool: &PgPool,
     id: Uuid,
@@ -356,10 +391,11 @@ pub async fn record_result(
     let outcome = sqlx::query!(
         r#"
         UPDATE tasks
-        SET state = 'succeeded', result = $3, heartbeat_at = now()
+        SET state = 'succeeded', result = $3,
+            heartbeat_at = CASE WHEN state = 'succeeded' THEN heartbeat_at ELSE now() END
         WHERE id = $1
           AND heartbeat_token_hash = sha256(convert_to($2, 'UTF8'))
-          AND state IN ('running', 'verifying')
+          AND (state IN ('running', 'verifying') OR (state = 'succeeded' AND result = $3))
           AND expires_at > now()
         "#,
         id,
@@ -607,6 +643,12 @@ mod tests {
         assert!(
             !record_heartbeat(&pool, task.id, "tok").await.unwrap(),
             "task is finished"
+        );
+        assert!(record_result(&pool, task.id, "tok", "hello").await.unwrap());
+        assert!(
+            !record_result(&pool, task.id, "other-tok", "hello")
+                .await
+                .unwrap()
         );
         assert!(!record_result(&pool, task.id, "tok", "again").await.unwrap());
     }

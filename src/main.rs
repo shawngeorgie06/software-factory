@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use factory::agent::AgentMode;
 use factory::api;
 use factory::cloud::Cloud;
 use factory::cloud::aws::{AwsCloud, AwsCloudConfig};
@@ -54,6 +55,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let reconciler_config = ReconcilerConfig {
         deployment: cloud_config.deployment.clone(),
+        agent_mode: AgentMode::parse(
+            &std::env::var("FACTORY_AGENT_MODE").unwrap_or_else(|_| "hello".into()),
+            std::env::var("FACTORY_CODEX_MODEL").ok(),
+        )?,
         interval: Duration::from_secs(optional_u64("FACTORY_RECONCILE_INTERVAL_SECS", 5)?),
         heartbeat_timeout: Duration::from_secs(optional_u64(
             "FACTORY_HEARTBEAT_TIMEOUT_SECS",
@@ -81,6 +86,10 @@ async fn main() -> anyhow::Result<()> {
         reconciler_config.heartbeat_timeout > reconciler_config.interval,
         "FACTORY_HEARTBEAT_TIMEOUT_SECS must be longer than FACTORY_RECONCILE_INTERVAL_SECS"
     );
+
+    if matches!(reconciler_config.agent_mode, AgentMode::Codex { .. }) {
+        factory::agent::validate_codex_url(&reconciler_config.agent_base_url)?;
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -128,6 +137,12 @@ async fn main() -> anyhow::Result<()> {
             "FACTORY_GITHUB_APP_ID and FACTORY_GITHUB_PRIVATE_KEY_PARAMETER must be set together"
         ),
     };
+    if matches!(reconciler_config.agent_mode, AgentMode::Codex { .. }) {
+        anyhow::ensure!(
+            github.is_some(),
+            "codex mode requires a configured GitHub App"
+        );
+    }
     let mut reconciler = Reconciler::new(pool.clone(), cloud, reconciler_config);
     if let Some(github) = github {
         reconciler = reconciler.with_github(github);

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE tasks SET state = 'verifying', heartbeat_at = now() WHERE id = $1 AND heartbeat_token_hash = sha256(convert_to($2, 'UTF8')) AND state IN ('running', 'verifying') AND expires_at > now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1bd4c75cd78c425795d5d533f88bd556c6444d241dd010fa223eb19158313142"
+}

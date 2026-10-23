@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT installation_id, repository_id, model_key_parameter FROM repository_credentials WHERE tenant_id = $1 AND repository = $2",
+  "query": "SELECT installation_id, repository_id, model_key_parameter, check_command FROM repository_credentials WHERE tenant_id = $1 AND repository = $2",
   "describe": {
     "columns": [
       {
@@ -35,6 +35,17 @@
             "name": "model_key_parameter"
           }
         }
+      },
+      {
+        "ordinal": 3,
+        "name": "check_command",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "repository_credentials",
+            "name": "check_command"
+          }
+        }
       }
     ],
     "parameters": {
@@ -46,8 +57,9 @@
     "nullable": [
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "a9bd1882359ee7bc1a3fa5e80aadd6addcc89bd588b007711f42820285c88503"
+  "hash": "d4e6d90ddda95b5e8cb3d8e2f6aca5cb6f5295363137540eb00a11ca847ca68c"
 }
