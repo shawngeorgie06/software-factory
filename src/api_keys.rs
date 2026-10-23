@@ -100,7 +100,9 @@ pub async fn authenticate(pool: &PgPool, key: &str) -> anyhow::Result<Option<Uui
     {
         // Bookkeeping only: a failure here must not reject a valid key.
         if let Err(error) = sqlx::query!(
-            "UPDATE api_keys SET last_used_at = now() WHERE id = $1",
+            // Rechecked here so concurrent first uses don't each write the row.
+            "UPDATE api_keys SET last_used_at = now()
+             WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')",
             row.id
         )
         .execute(pool)

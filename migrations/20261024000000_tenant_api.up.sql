@@ -16,8 +16,5 @@ ALTER TABLE tasks
     ADD COLUMN idempotency_key text
         CONSTRAINT tasks_idempotency_key_size CHECK (char_length(idempotency_key) BETWEEN 1 AND 255);
 
-CREATE UNIQUE INDEX tasks_tenant_idempotency_key_idx ON tasks (tenant_id, idempotency_key)
-    WHERE idempotency_key IS NOT NULL;
-
--- Newest-first listing per tenant.
-CREATE INDEX tasks_tenant_created_idx ON tasks (tenant_id, created_at DESC, id DESC);
+-- The tasks indexes are built concurrently in the next two migrations, so applying this to a
+-- populated table doesn't block task traffic for the length of an index build.
