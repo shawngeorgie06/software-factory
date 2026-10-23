@@ -2,7 +2,7 @@
 
 Rust orchestrator for task-scoped EC2 VMs. Postgres owns task state; a reconciler launches and cleans up instances through the `Cloud` trait. VMs accept commands through SSM with no inbound network access.
 
-Milestones 1–3 provide task storage, reconciliation, and a heartbeat/`hello` round trip. Milestone 4 adds encrypted credential delivery and repository-scoped GitHub App tokens. Milestone 5 adds a Codex CLI runner, administrator-configured verification, and task-branch PR creation. Deployment and monitoring are later milestones.
+Milestones 1–3 provide task storage, reconciliation, and a heartbeat/`hello` round trip. Milestone 4 adds encrypted credential delivery and repository-scoped GitHub App tokens. Milestone 5 adds a Codex CLI runner, administrator-configured verification, and task-branch PR creation. Milestone 6 adds an authenticated task API for submitting, listing, and cancelling tasks. Deployment and monitoring are later milestones.
 
 ## Test locally
 
@@ -28,6 +28,39 @@ SQLx compiles from the checked-in `.sqlx` cache with `SQLX_OFFLINE=true`. To upd
 cargo sqlx migrate run
 cargo sqlx prepare -- --all-targets
 ```
+
+## Submit tasks through the API
+
+Tenants call the task API with an API key. An administrator creates keys with the same binary; it needs only `DATABASE_URL`:
+
+```sh
+factory api-key create <tenant-uuid> "ci"   # prints the key once, on stdout
+factory api-key list <tenant-uuid>
+factory api-key revoke <key-uuid>           # takes effect on the next request
+```
+
+Keys look like `sf_` followed by 64 hex characters. Only their SHA-256 is stored. Send them as `Authorization: Bearer <key>`. A key only ever sees its own tenant's tasks; another tenant's task returns 404.
+
+| Request | Result |
+| --- | --- |
+| `POST /v1/tasks` with `{"repo_url", "instructions", "ttl_seconds"?}` | `201` with the queued task |
+| `GET /v1/tasks?state=&limit=&cursor=` | Newest first, up to 100 per page, with `next_cursor` |
+| `GET /v1/tasks/{id}` | The task, including `result` or `failure_reason` |
+| `POST /v1/tasks/{id}/cancel` | `200` with the failed task; `409` if it already finished |
+
+```sh
+curl -sS https://factory.example.com/v1/tasks \
+  -H "Authorization: Bearer $FACTORY_API_KEY" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -H 'Content-Type: application/json' \
+  -d '{"repo_url": "https://github.com/owner/repo", "instructions": "Fix the failing test"}'
+```
+
+`repo_url` must be `https://github.com/<owner>/<repo>`. Instructions are limited to 64 KiB. `ttl_seconds` runs from 300 to `FACTORY_TASK_MAX_TTL_SECS` and defaults to `FACTORY_TASK_DEFAULT_TTL_SECS`; the reconciler terminates the VM when it expires. In Codex mode, a task's repository must already have a `repository_credentials` binding with checks, or submission returns `422`.
+
+Retrying with the same `Idempotency-Key` and input returns the original task with `200`. Reusing a key for different input returns `409`. Each tenant may have `FACTORY_MAX_PENDING_TASKS_PER_TENANT` queued or active tasks; more return `429`. A replay is matched on `repo_url` and `instructions` only; a different `ttl_seconds` is ignored. Replays are answered before the repository binding is checked, so a retry still succeeds after the binding changes. A tenant's submissions are handled one at a time; if the database is saturated or a submission waits more than 5 seconds behind the same tenant's earlier ones, the API returns `503` with `Retry-After`.
+
+Cancelling marks the task failed with reason `cancelled through the task API`. The next reconciler tick terminates its VM and deletes its credential bundle, and the agent's token stops working at once. A runner that is already publishing can still push its branch or open a PR before the VM stops.
 
 ## Configure credential delivery
 

@@ -7,8 +7,11 @@ use uuid::Uuid;
 const CLAIM_LOCK_KEY: i64 = 0x6661_6374_6f72_7931; // "factory1"
 
 /// Mirrors the Postgres `task_state` enum. Variant names map to the lowercase labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, serde::Serialize, serde::Deserialize,
+)]
 #[sqlx(type_name = "task_state", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum TaskState {
     Queued,
     Launching,
@@ -408,6 +411,202 @@ pub async fn record_result(
     Ok(outcome.rows_affected() == 1)
 }
 
+/// Namespace for per-tenant submission locks (two-key advisory locks don't collide with
+/// [`CLAIM_LOCK_KEY`]). Arbitrary but fixed.
+const SUBMIT_LOCK_NAMESPACE: i32 = 0x7375_626d; // "subm"
+
+/// Reason recorded on tasks cancelled through the tenant API.
+pub const CANCELLED_REASON: &str = "cancelled through the task API";
+
+pub struct Submission<'a> {
+    pub task: NewTask<'a>,
+    pub idempotency_key: Option<&'a str>,
+    /// Most queued or active tasks a tenant may have at once.
+    pub max_pending: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Submitted {
+    Created(Task),
+    /// An earlier submission with the same idempotency key and input.
+    Existing(Task),
+    /// The idempotency key was already used with different input.
+    KeyReused,
+    TooManyPending,
+}
+
+/// What an earlier submission under the same idempotency key means for a retry with this
+/// input, if one exists. The ttl is not part of the input compared.
+pub async fn replay<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    tenant_id: Uuid,
+    repo_url: &str,
+    instructions: &str,
+    key: &str,
+) -> anyhow::Result<Option<Submitted>> {
+    let existing = sqlx::query_as!(
+        Task,
+        r#"
+        SELECT id, tenant_id, state AS "state: TaskState", vm_instance_id,
+               heartbeat_at, expires_at, created_at, updated_at,
+               repo_url, instructions, result, failure_reason, agent_command_id
+        FROM tasks
+        WHERE tenant_id = $1 AND idempotency_key = $2
+        "#,
+        tenant_id,
+        key,
+    )
+    .fetch_optional(executor)
+    .await
+    .context("looking up idempotency key")?;
+    Ok(existing.map(|task| {
+        if task.repo_url == repo_url && task.instructions == instructions {
+            Submitted::Existing(task)
+        } else {
+            Submitted::KeyReused
+        }
+    }))
+}
+
+/// Queues a tenant's task, enforcing its pending-task cap and idempotency key.
+pub async fn submit_task(pool: &PgPool, submission: &Submission<'_>) -> anyhow::Result<Submitted> {
+    let new = &submission.task;
+    let mut tx = pool.begin().await.context("starting submit transaction")?;
+    // The cap and the idempotency lookup are check-then-act, so a tenant's submissions take
+    // turns. Other tenants are not blocked.
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock($1, hashtext($2::text))",
+        SUBMIT_LOCK_NAMESPACE,
+        new.tenant_id.to_string(),
+    )
+    .execute(&mut *tx)
+    .await
+    .context("taking submit lock")?;
+
+    if let Some(key) = submission.idempotency_key
+        && let Some(replay) =
+            replay(&mut *tx, new.tenant_id, new.repo_url, new.instructions, key).await?
+    {
+        return Ok(replay);
+    }
+
+    let pending = sqlx::query_scalar!(
+        r#"
+        SELECT count(*) AS "n!"
+        FROM tasks
+        WHERE tenant_id = $1 AND state NOT IN ('succeeded', 'failed')
+          AND expires_at > statement_timestamp()
+        "#,
+        new.tenant_id,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .context("counting pending tasks")?;
+    if pending >= submission.max_pending {
+        return Ok(Submitted::TooManyPending);
+    }
+
+    let task = sqlx::query_as!(
+        Task,
+        r#"
+        INSERT INTO tasks (tenant_id, repo_url, instructions, expires_at, idempotency_key)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, tenant_id, state AS "state: TaskState", vm_instance_id,
+                  heartbeat_at, expires_at, created_at, updated_at,
+                  repo_url, instructions, result, failure_reason, agent_command_id
+        "#,
+        new.tenant_id,
+        new.repo_url,
+        new.instructions,
+        new.expires_at,
+        submission.idempotency_key,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .context("inserting submitted task")?;
+    tx.commit().await.context("committing submitted task")?;
+    Ok(Submitted::Created(task))
+}
+
+/// One page of a tenant's tasks, newest first. `before` is the id of the last task on the
+/// previous page; an id the tenant doesn't own yields an empty page. `created_at` is the
+/// inserting transaction's start time, so a task whose insert commits late can sort behind
+/// a page already served.
+pub async fn list_tasks(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    state: Option<TaskState>,
+    before: Option<Uuid>,
+    limit: i64,
+) -> anyhow::Result<Vec<Task>> {
+    sqlx::query_as!(
+        Task,
+        r#"
+        SELECT id, tenant_id, state AS "state: TaskState", vm_instance_id,
+               heartbeat_at, expires_at, created_at, updated_at,
+               repo_url, instructions, result, failure_reason, agent_command_id
+        FROM tasks
+        WHERE tenant_id = $1
+          AND ($2::task_state IS NULL OR state = $2)
+          AND ($3::uuid IS NULL OR (created_at, id) <
+               (SELECT created_at, id FROM tasks WHERE tenant_id = $1 AND id = $3))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4
+        "#,
+        tenant_id,
+        state as _,
+        before,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+    .context("listing tasks")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Cancelled {
+    /// Cancelled now, or by an earlier request.
+    Cancelled(Task),
+    /// Already finished some other way.
+    Finished(Task),
+    NotFound,
+}
+
+/// Fails a tenant's unfinished task. The reconciler then terminates its VM, and the agent's
+/// token stops working because the task is no longer running.
+pub async fn cancel_task(pool: &PgPool, tenant_id: Uuid, id: Uuid) -> anyhow::Result<Cancelled> {
+    let cancelled = sqlx::query_as!(
+        Task,
+        r#"
+        UPDATE tasks
+        SET state = 'failed', failure_reason = $3
+        WHERE tenant_id = $1 AND id = $2 AND state NOT IN ('succeeded', 'failed')
+        RETURNING id, tenant_id, state AS "state: TaskState", vm_instance_id,
+                  heartbeat_at, expires_at, created_at, updated_at,
+                  repo_url, instructions, result, failure_reason, agent_command_id
+        "#,
+        tenant_id,
+        id,
+        CANCELLED_REASON,
+    )
+    .fetch_optional(pool)
+    .await
+    .context("cancelling task")?;
+    if let Some(task) = cancelled {
+        return Ok(Cancelled::Cancelled(task));
+    }
+    Ok(match get_task(pool, tenant_id, id).await? {
+        None => Cancelled::NotFound,
+        Some(task)
+            if task.state == TaskState::Failed
+                && task.failure_reason.as_deref() == Some(CANCELLED_REASON) =>
+        {
+            Cancelled::Cancelled(task)
+        }
+        Some(task) => Cancelled::Finished(task),
+    })
+}
+
 /// Creates a task with placeholder input, for tests that only care about scheduling.
 #[cfg(test)]
 pub async fn create_test_task(
@@ -654,6 +853,59 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn tasks_expiring_while_a_submission_waits_free_their_slot(pool: PgPool) {
+        let tenant = Uuid::new_v4();
+        let task = create_test_task(&pool, tenant, in_one_hour())
+            .await
+            .unwrap();
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+            .bind(SUBMIT_LOCK_NAMESPACE)
+            .bind(tenant.to_string())
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let submitting = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let submission = Submission {
+                    task: NewTask {
+                        tenant_id: tenant,
+                        repo_url: "https://github.com/owner/repo",
+                        instructions: "x",
+                        expires_at: in_one_hour(),
+                    },
+                    idempotency_key: None,
+                    max_pending: 1,
+                };
+                submit_task(&pool, &submission).await.unwrap()
+            }
+        });
+        // Once the submission waits on the lock, its transaction has started.
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        sqlx::query("UPDATE tasks SET expires_at = clock_timestamp() WHERE id = $1")
+            .bind(task.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+
+        assert!(matches!(submitting.await.unwrap(), Submitted::Created(_)));
+    }
+
+    #[sqlx::test]
     async fn token_without_a_hash_set_matches_nothing(pool: PgPool) {
         let task = running_task(&pool).await;
         assert!(!record_heartbeat(&pool, task.id, "anything").await.unwrap());
@@ -783,6 +1035,19 @@ mod tests {
         }
 
         assert_eq!(rust_labels, pg_labels);
+
+        // The task API uses the same labels in JSON.
+        let json_labels: Vec<String> = TaskState::ALL
+            .iter()
+            .map(|state| {
+                serde_json::to_value(state)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(json_labels, pg_labels);
     }
 
     #[sqlx::test]

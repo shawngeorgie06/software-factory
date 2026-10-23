@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT count(*) AS \"n!\"\n        FROM tasks\n        WHERE tenant_id = $1 AND state NOT IN ('succeeded', 'failed')\n          AND expires_at > statement_timestamp()\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f8a0a7b594f380fc5afad54313f7a4892be5b8bfc37392ac702d1595f320f676"
+}
