@@ -201,7 +201,7 @@ fn saturated(error: &anyhow::Error) -> bool {
 }
 
 /// Resolves the caller's tenant from `Authorization: Bearer <key>`.
-async fn tenant(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, Response> {
+async fn tenant(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, Box<Response>> {
     let unauthorized = || {
         let mut response = problem(StatusCode::UNAUTHORIZED, "a valid API key is required");
         response
@@ -215,17 +215,20 @@ async fn tenant(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, Response>
         .and_then(|v| v.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
         .map(|(_, key)| key.trim_start_matches(' '))
-        .ok_or_else(unauthorized)?;
+        .ok_or_else(|| Box::new(unauthorized()))?;
     match crate::api_keys::authenticate(&state.pool, key).await {
         Ok(Some(tenant_id)) => Ok(tenant_id),
-        Ok(None) => Err(unauthorized()),
+        Ok(None) => Err(Box::new(unauthorized())),
         Err(error) if saturated(&error) => {
             warn!(error = ?error, "API key lookup hit a busy database");
-            Err(busy())
+            Err(Box::new(busy()))
         }
         Err(error) => {
             error!(error = ?error, "API key lookup failed");
-            Err(problem(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
+            Err(Box::new(problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )))
         }
     }
 }
@@ -245,7 +248,7 @@ async fn create(State(state): State<ApiState>, request: Request) -> Response {
     let headers = request.headers().clone();
     let tenant_id = match tenant(&state, &headers).await {
         Ok(tenant_id) => tenant_id,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let body = match axum::Json::<CreateBody>::from_request(request, &state).await {
         Ok(axum::Json(body)) => body,
@@ -405,7 +408,7 @@ async fn list(
 ) -> Response {
     let tenant_id = match tenant(&state, &headers).await {
         Ok(tenant_id) => tenant_id,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Query(params) = match params {
         Ok(params) => params,
@@ -450,7 +453,7 @@ async fn show(
 ) -> Response {
     let tenant_id = match tenant(&state, &headers).await {
         Ok(tenant_id) => tenant_id,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Ok(id) = Uuid::parse_str(&id) else {
         return not_found();
@@ -469,7 +472,7 @@ async fn cancel(
 ) -> Response {
     let tenant_id = match tenant(&state, &headers).await {
         Ok(tenant_id) => tenant_id,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Ok(id) = Uuid::parse_str(&id) else {
         return not_found();
