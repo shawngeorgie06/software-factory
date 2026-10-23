@@ -1,0 +1,1 @@
+ALTER TABLE repository_credentials DROP CONSTRAINT repository_check_shape;

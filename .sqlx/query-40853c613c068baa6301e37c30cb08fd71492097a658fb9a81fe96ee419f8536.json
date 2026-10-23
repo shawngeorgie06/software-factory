@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tenant_id, repo_url, instructions FROM tasks WHERE id = $1 AND heartbeat_token_hash = sha256(convert_to($2, 'UTF8')) AND state IN ('running', 'verifying') AND expires_at > now()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tenant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "tenant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repo_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "repo_url"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "instructions",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tasks",
+            "name": "instructions"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "40853c613c068baa6301e37c30cb08fd71492097a658fb9a81fe96ee419f8536"
+}
