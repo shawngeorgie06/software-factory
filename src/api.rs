@@ -26,25 +26,48 @@ pub fn router(pool: PgPool) -> Router {
         .with_state(pool)
 }
 
-/// 256 bits from the OS CSPRNG (via two v4 UUIDs, 122 random bits each), hex encoded.
+/// 244 random bits from the OS CSPRNG (via two v4 UUIDs, 122 random bits each), hex encoded.
 pub fn new_agent_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-/// The script SSM runs on a task's VM: one heartbeat, then a "hello" result.
-///
-/// `base_url` is how the VM reaches this API, e.g. `https://factory.example.com`.
-pub fn hello_agent_script(base_url: &str, task_id: Uuid, token: &str) -> String {
+/// Fetches a task's encrypted bundle on the VM; SSM sees only a parameter reference.
+/// AWS CLI v2 and Python 3 must be installed in the AMI. No secret is printed.
+pub fn hello_agent_script(
+    base_url: &str,
+    task_id: Uuid,
+    secret: &crate::cloud::SecretReference,
+) -> String {
     let task_url = format!("{}/v1/tasks/{task_id}", base_url.trim_end_matches('/'));
     format!(
-        "set -eu\n\
-         task_url={task_url}\n\
-         auth={auth}\n\
-         post() {{ curl -fsS --retry 5 --retry-all-errors --max-time 30 -X POST -H \"$auth\" \"$@\"; }}\n\
-         post \"$task_url/heartbeat\"\n\
-         post -H 'Content-Type: application/json' --data '{{\"result\":\"hello\"}}' \"$task_url/result\"\n",
+        r#"set +x
+set -eu
+umask 077
+parameter={parameter}
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+aws ssm get-parameter --name "$parameter" --region {region} --with-decryption --query Parameter.Value --output text > "$work/credentials.json"
+python3 - "$work/credentials.json" "$work/headers" <<'FACTORY_PY'
+import datetime, json, re, sys
+with open(sys.argv[1]) as f:
+    credentials = json.load(f)
+token = credentials.get("callback_token", "")
+expiry = datetime.datetime.fromisoformat(credentials["expires_at"].replace("Z", "+00:00"))
+if not re.fullmatch(r"[0-9a-f]{{64}}", token) or expiry <= datetime.datetime.now(datetime.timezone.utc):
+    sys.exit("task credentials are invalid or expired")
+with open(sys.argv[2], "w") as f:
+    f.write("Authorization: Bearer " + token + "\n")
+FACTORY_PY
+# The later coding-agent milestone will consume the remaining bundle fields here.
+task_url={task_url}
+post() {{ curl -fsS --retry 5 --retry-all-errors --max-time 30 -X POST -H "@$work/headers" "$@"; }}
+post "$task_url/heartbeat"
+post -H 'Content-Type: application/json' --data '{{"result":"hello"}}' "$task_url/result"
+"#,
+        parameter = shell_quote(&secret.name),
+        region = shell_quote(&secret.region),
         task_url = shell_quote(&task_url),
-        auth = shell_quote(&format!("Authorization: Bearer {token}")),
     )
 }
 
@@ -307,27 +330,93 @@ mod tests {
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
     }
 
-    /// Runs the real script under sh against the real router, with curl on PATH.
-    #[sqlx::test]
-    async fn hello_script_reports_to_the_api(pool: PgPool) {
-        let addr = serve(pool.clone()).await;
-        let token = new_agent_token();
-        let task = running_task(&pool, &token).await;
-
-        let script = hello_agent_script(&format!("http://{addr}/"), task.id, &token);
-        // Blocking call off the runtime, which is also serving the API.
+    async fn run_bootstrap(
+        addr: &str,
+        task: &Task,
+        value: serde_json::Value,
+        aws_exit: u8,
+    ) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = std::env::temp_dir().join(format!("factory-script-{}", Uuid::new_v4()));
+        std::fs::create_dir(&temp).unwrap();
+        let aws = temp.join("aws");
+        std::fs::write(&aws, format!(
+            "#!/bin/sh\n[ \"$*\" = 'ssm get-parameter --name /factory/test/tasks/test-bundle --region us-east-1 --with-decryption --query Parameter.Value --output text' ] || exit 98\n[ {aws_exit} = 0 ] || exit {aws_exit}\nprintf '%s' {}\n", shell_quote(&value.to_string())
+        )).unwrap();
+        std::fs::set_permissions(&aws, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let script = hello_agent_script(
+            &format!("http://{addr}/"),
+            task.id,
+            &crate::cloud::SecretReference {
+                name: "/factory/test/tasks/test-bundle".into(),
+                region: "us-east-1".into(),
+            },
+        );
+        assert!(!script.contains(value["callback_token"].as_str().unwrap()));
+        let path = format!("{}:{}", temp.display(), std::env::var("PATH").unwrap());
+        let work_root = temp.clone();
         let output = tokio::task::spawn_blocking(move || {
             std::process::Command::new("sh")
                 .args(["-c", &script])
+                .env("PATH", path)
+                .env("TMPDIR", work_root)
                 .output()
         })
         .await
         .unwrap()
         .unwrap();
+        assert_eq!(
+            std::fs::read_dir(&temp).unwrap().count(),
+            1,
+            "temporary bundle and header removed"
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+        output
+    }
 
+    /// Runs real sh, Python, and curl against the router; only AWS is a local stub.
+    #[sqlx::test]
+    async fn hello_script_reports_to_the_api(pool: PgPool) {
+        let addr = serve(pool.clone()).await;
+        let token = new_agent_token();
+        let task = running_task(&pool, &token).await;
+        let output = run_bootstrap(
+            &addr,
+            &task,
+            serde_json::json!({"callback_token": token, "expires_at": task.expires_at}),
+            0,
+        )
+        .await;
         assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(&token));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&token));
         let done = reload(&pool, &task).await;
         assert_eq!(done.state, TaskState::Succeeded);
         assert_eq!(done.result.as_deref(), Some("hello"));
+    }
+
+    #[sqlx::test]
+    async fn bootstrap_stops_without_reporting_when_fetch_fails_or_bundle_expired(pool: PgPool) {
+        let addr = serve(pool.clone()).await;
+        let token = new_agent_token();
+        let task = running_task(&pool, &token).await;
+        let before = reload(&pool, &task).await;
+        for (expires_at, aws_exit) in [(task.expires_at, 1), (Utc::now() - Duration::seconds(1), 0)]
+        {
+            let output = run_bootstrap(
+                &addr,
+                &task,
+                serde_json::json!({"callback_token": token, "expires_at": expires_at}),
+                aws_exit,
+            )
+            .await;
+            assert!(!output.status.success());
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(&token));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(&token));
+            let done = reload(&pool, &task).await;
+            assert_eq!(done.state, TaskState::Running);
+            assert!(done.result.is_none());
+            assert_eq!(done.heartbeat_at, before.heartbeat_at);
+        }
     }
 }

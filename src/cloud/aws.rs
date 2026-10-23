@@ -29,12 +29,15 @@ pub struct AwsCloudConfig {
     pub security_group_id: String,
     /// Instance profile whose role allows SSM (e.g. AmazonSSMManagedInstanceCore).
     pub instance_profile_name: String,
+    pub secrets_kms_key_arn: String,
 }
 
 pub struct AwsCloud {
     ec2: Client,
     ssm: aws_sdk_ssm::Client,
     config: AwsCloudConfig,
+    parameters: super::secrets::ParameterStore,
+    region: String,
 }
 
 impl AwsCloud {
@@ -45,7 +48,24 @@ impl AwsCloud {
         let sdk_config = aws_config::load_from_env().await;
         let ec2 = Client::new(&sdk_config);
         let ssm = aws_sdk_ssm::Client::new(&sdk_config);
-        let cloud = AwsCloud { ec2, ssm, config };
+        let region = sdk_config
+            .region()
+            .context("AWS region must be configured")?
+            .as_ref()
+            .to_owned();
+        let parameters = super::secrets::ParameterStore::new(
+            ssm.clone(),
+            &config.deployment,
+            &config.secrets_kms_key_arn,
+            &region,
+        )?;
+        let cloud = AwsCloud {
+            ec2,
+            ssm,
+            config,
+            parameters,
+            region,
+        };
         cloud.verify_security_group().await?;
         Ok(cloud)
     }
@@ -156,6 +176,59 @@ fn tag(key: &str, value: String) -> Tag {
 }
 
 impl Cloud for AwsCloud {
+    async fn script_ready(&self, instance_id: &str) -> anyhow::Result<bool> {
+        let filter = aws_sdk_ssm::types::InstanceInformationStringFilter::builder()
+            .key("InstanceIds")
+            .values(instance_id)
+            .build()
+            .map_err(|_| anyhow!("building SSM readiness filter failed"))?;
+        let output = self
+            .ssm
+            .describe_instance_information()
+            .filters(filter)
+            .customize()
+            .config_override(
+                aws_sdk_ssm::config::Builder::default().timeout_config(
+                    aws_sdk_ssm::config::timeout::TimeoutConfig::builder()
+                        .operation_timeout(std::time::Duration::from_secs(10))
+                        .build(),
+                ),
+            )
+            .send()
+            .await
+            .map_err(|_| anyhow!("checking SSM readiness failed"))?;
+        Ok(output.instance_information_list().iter().any(|info| {
+            info.instance_id() == Some(instance_id)
+                && info.ping_status() == Some(&aws_sdk_ssm::types::PingStatus::Online)
+        }))
+    }
+
+    async fn read_secure(&self, name: &str) -> anyhow::Result<String> {
+        self.parameters.read_secure(name).await
+    }
+    async fn put_task_secret(
+        &self,
+        tenant_id: uuid::Uuid,
+        task_id: uuid::Uuid,
+        instance_id: &str,
+        value: &str,
+    ) -> anyhow::Result<super::SecretReference> {
+        let name = self
+            .parameters
+            .put_task(tenant_id, task_id, instance_id, value)
+            .await?;
+        Ok(super::SecretReference {
+            name,
+            region: self.region.clone(),
+        })
+    }
+    async fn list_task_secrets(&self) -> anyhow::Result<Vec<super::StoredTaskSecret>> {
+        self.parameters.list_tasks().await
+    }
+    async fn delete_task_secret(&self, name: &str) -> anyhow::Result<()> {
+        self.parameters.delete_task(name).await
+    }
+
     async fn launch(&self, request: &LaunchRequest) -> anyhow::Result<String> {
         let tags = [
             tag(DEPLOYMENT_TAG, self.config.deployment.clone()),

@@ -13,10 +13,13 @@ use uuid::Uuid;
 
 use crate::api;
 use crate::cloud::{Cloud, Instance, InstanceState, LaunchRequest, ScriptRequest, ScriptStart};
+use crate::credentials::{self, RepositoryTokenIssuer, TaskCredentials};
 use crate::db::{self, Task, TaskState};
+use crate::github::{GitHubApp, InstallationToken};
 
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
+    pub deployment: String,
     pub interval: Duration,
     /// A launching/running/verifying task with no heartbeat for this long is failed.
     pub heartbeat_timeout: Duration,
@@ -30,21 +33,39 @@ pub struct ReconcilerConfig {
     pub agent_base_url: String,
 }
 
-pub struct Reconciler<C> {
+struct RepositoryAccess {
+    github: InstallationToken,
+    model_key: String,
+}
+
+pub struct Reconciler<C, G = GitHubApp> {
+    github: Option<G>,
     pool: PgPool,
     cloud: C,
     config: ReconcilerConfig,
 }
 
-impl<C: Cloud> Reconciler<C> {
+impl<C: Cloud> Reconciler<C, GitHubApp> {
     pub fn new(pool: PgPool, cloud: C, config: ReconcilerConfig) -> Self {
         Reconciler {
+            github: None,
             pool,
             cloud,
             config,
         }
     }
 
+    pub fn with_github<G: RepositoryTokenIssuer>(self, github: G) -> Reconciler<C, G> {
+        Reconciler {
+            pool: self.pool,
+            cloud: self.cloud,
+            config: self.config,
+            github: Some(github),
+        }
+    }
+}
+
+impl<C: Cloud, G: RepositoryTokenIssuer> Reconciler<C, G> {
     /// Ticks until `shutdown` resolves. A failed tick is logged and retried next interval.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
         let mut interval = tokio::time::interval(self.config.interval);
@@ -112,9 +133,28 @@ impl<C: Cloud> Reconciler<C> {
             }
         }
 
-        // Re-read after launches/adoptions so newly recorded VMs count as owned.
+        // VM termination must not wait for slow Parameter Store pagination.
         let live = db::list_live_tasks(&self.pool).await?;
-        self.terminate_unowned(&instances, &live).await
+        let vm_result = self.terminate_unowned(&instances, &live).await;
+        // Snapshot Parameter Store BEFORE reading live tasks: a concurrent start after
+        // this snapshot cannot be mistaken for an orphan by an older database view.
+        let secrets = self.cloud.list_task_secrets().await;
+        let live = db::list_live_tasks(&self.pool).await?;
+        match secrets {
+            Ok(secrets) => {
+                for secret in secrets {
+                    if !live
+                        .iter()
+                        .any(|task| task.id == secret.task_id && task.tenant_id == secret.tenant_id)
+                        && let Err(error) = self.cloud.delete_task_secret(&secret.name).await
+                    {
+                        warn!(task_id = %secret.task_id, error = %error, "could not delete task secrets; will retry");
+                    }
+                }
+            }
+            Err(error) => warn!(error = %error, "could not list task secrets; will retry"),
+        }
+        vm_result
     }
 
     /// Sends the agent script to a running task's VM with a fresh token.
@@ -135,10 +175,62 @@ impl<C: Cloud> Reconciler<C> {
         if !db::set_agent_token(&mut *tx, task.id, &token).await? {
             return Ok(()); // Finished, started, or being started by another reconciler.
         }
-        let script = api::hello_agent_script(&self.config.agent_base_url, task.id, &token);
+        if task.expires_at <= chrono::Utc::now() {
+            return Ok(());
+        }
+        if !self.cloud.script_ready(instance_id).await? {
+            return Ok(());
+        }
+        let access = match self.repository_access(task, &mut tx).await {
+            Ok(access) => access,
+            Err(error)
+                if error.is::<credentials::RepositoryConfigurationError>()
+                    || error.is::<crate::cloud::SecretConfigurationError>()
+                    || error.is::<crate::github::GitHubConfigurationError>() =>
+            {
+                db::fail_agent_start(&mut *tx, task.id, &error.to_string()).await?;
+                tx.commit()
+                    .await
+                    .context("committing credential configuration failure")?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if task.expires_at <= chrono::Utc::now() {
+            return Ok(());
+        }
+        let credentials = TaskCredentials {
+            callback_token: &token,
+            expires_at: task.expires_at,
+            github_token: access.as_ref().map(|a| a.github.token.as_str()),
+            github_expires_at: access.as_ref().map(|a| a.github.expires_at),
+            model_api_key: access.as_ref().map(|a| a.model_key.as_str()),
+        };
+        let value = serde_json::to_string(&credentials).context("encoding task credentials")?;
+        if value.len() > 4096 {
+            db::fail_agent_start(
+                &mut *tx,
+                task.id,
+                "task credentials exceed the 4096-byte limit",
+            )
+            .await?;
+            tx.commit()
+                .await
+                .context("committing credential size failure")?;
+            return Ok(());
+        }
+        let parameter = self
+            .cloud
+            .put_task_secret(task.tenant_id, task.id, instance_id, &value)
+            .await?;
+        let script = api::hello_agent_script(&self.config.agent_base_url, task.id, &parameter);
         let timeout = (task.expires_at - chrono::Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
+        if timeout.is_zero() {
+            self.cloud.delete_task_secret(&parameter.name).await?;
+            return Ok(());
+        }
         let request = ScriptRequest {
             task_id: task.id,
             instance_id,
@@ -147,6 +239,8 @@ impl<C: Cloud> Reconciler<C> {
         };
         match self.cloud.run_script(&request).await? {
             ScriptStart::NotReady => {
+                // A definite rejection started no script; remove this unused attempt now.
+                self.cloud.delete_task_secret(&parameter.name).await?;
                 info!(task_id = %task.id, %instance_id, "SSM can't reach instance yet (agent registering, or missing SSM permissions); will retry");
             }
             ScriptStart::Sent { command_id } => {
@@ -159,6 +253,45 @@ impl<C: Cloud> Reconciler<C> {
             }
         }
         Ok(())
+    }
+
+    async fn repository_access(
+        &self,
+        task: &Task,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> anyhow::Result<Option<RepositoryAccess>> {
+        let Some(github) = &self.github else {
+            return Ok(None);
+        };
+        let binding = credentials::for_task(&mut **tx, task.tenant_id, &task.repo_url).await?;
+        let prefix = format!(
+            "/factory/{}/tenants/{}/",
+            self.config.deployment, task.tenant_id
+        );
+        if !binding.model_key_parameter.starts_with(&prefix) {
+            return Err(credentials::RepositoryConfigurationError(
+                "model key parameter does not belong to tenant",
+            )
+            .into());
+        }
+        let model_key = self.cloud.read_secure(&binding.model_key_parameter).await?;
+        if model_key.is_empty() || model_key.len() > 2048 || model_key.chars().any(char::is_control)
+        {
+            return Err(credentials::RepositoryConfigurationError(
+                "model key must be a nonempty single-line secret of at most 2048 bytes",
+            )
+            .into());
+        }
+        if task.expires_at <= chrono::Utc::now() {
+            anyhow::bail!("task expired while preparing credentials");
+        }
+        let github = github
+            .mint_repository_token(
+                u64::try_from(binding.installation_id)?,
+                u64::try_from(binding.repository_id)?,
+            )
+            .await?;
+        Ok(Some(RepositoryAccess { github, model_key }))
     }
 
     async fn advance_launching(&self, task: &Task, instances: &[Instance]) -> anyhow::Result<()> {
@@ -284,10 +417,11 @@ mod tests {
     const MAX_ACTIVE_PER_TENANT: i64 = 10;
     const AGENT_BASE_URL: &str = "https://factory.test";
 
-    /// The bearer token embedded in an agent script.
-    fn token_in(script: &str) -> &str {
-        let start = script.find("Bearer ").unwrap() + "Bearer ".len();
-        &script[start..start + 64]
+    fn token_in(cloud: &FakeCloud, script: &str) -> String {
+        cloud.secret_for_script(script)["callback_token"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     /// Ticks a fresh task to `running` with a booted VM, before its agent is started.
@@ -316,6 +450,7 @@ mod tests {
             pool.clone(),
             Arc::clone(cloud),
             ReconcilerConfig {
+                deployment: DEPLOYMENT.into(),
                 interval: Duration::from_secs(5),
                 heartbeat_timeout: Duration::from_secs(HEARTBEAT_TIMEOUT_SECS as u64),
                 max_launches_per_tick: MAX_LAUNCHES,
@@ -785,7 +920,7 @@ mod tests {
         let r = reconciler(&pool, &cloud);
         let t = running_without_agent(&pool, &r, &cloud).await;
         r.tick().await.unwrap();
-        let token = token_in(&cloud.scripts()[0].script).to_string();
+        let token = token_in(&cloud, &cloud.scripts()[0].script).to_string();
 
         // What the script does on the VM, minus HTTP (covered in api tests).
         assert!(db::record_heartbeat(&pool, t.id, &token).await.unwrap());
@@ -896,7 +1031,7 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            db::record_heartbeat(&pool, t.id, token_in(&scripts[1].script))
+            db::record_heartbeat(&pool, t.id, &token_in(&cloud, &scripts[1].script))
                 .await
                 .unwrap()
         );
@@ -931,18 +1066,36 @@ mod tests {
         let cloud = Arc::new(FakeCloud::default());
         let r = reconciler(&pool, &cloud);
         let t = running_without_agent(&pool, &r, &cloud).await;
-        cloud.hang_after_next_send();
+        let sent = cloud.hang_after_next_send();
+        {
+            let tick = r.tick();
+            tokio::pin!(tick);
+            tokio::select! {
+                result = &mut tick => panic!("tick should hang after sending: {result:?}"),
+                observed = tokio::time::timeout(Duration::from_secs(10), sent.notified()) => {
+                    observed.expect("script must be accepted before abandoning the tick");
+                }
+            }
+        } // Cancel only after the fake has accepted the script.
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), r.tick())
-                .await
-                .is_err()
-        );
+        // SQLx queues rollback when the cancelled transaction is dropped. Acquire the
+        // same row lock to wait for that rollback instead of racing SKIP LOCKED next tick.
+        let mut rollback_finished = pool.begin().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sqlx::query("SELECT 1 FROM tasks WHERE id = $1 FOR UPDATE")
+                .bind(t.id)
+                .execute(&mut *rollback_finished),
+        )
+        .await
+        .expect("cancelled transaction must release its row lock")
+        .unwrap();
+        rollback_finished.rollback().await.unwrap();
         let first = cloud.scripts()[0].clone();
         let row = task(&pool, t.id).await;
         assert_eq!(row.agent_command_id, None);
         assert!(
-            !db::record_heartbeat(&pool, t.id, token_in(&first.script))
+            !db::record_heartbeat(&pool, t.id, &token_in(&cloud, &first.script))
                 .await
                 .unwrap()
         );
@@ -955,14 +1108,307 @@ mod tests {
             Some(scripts[1].command_id.clone())
         );
         assert!(
-            !db::record_heartbeat(&pool, t.id, token_in(&first.script))
+            !db::record_heartbeat(&pool, t.id, &token_in(&cloud, &first.script))
                 .await
                 .unwrap()
         );
         assert!(
-            db::record_heartbeat(&pool, t.id, token_in(&scripts[1].script))
+            db::record_heartbeat(&pool, t.id, &token_in(&cloud, &scripts[1].script))
                 .await
                 .unwrap()
         );
+    }
+    struct FakeGithub;
+    impl RepositoryTokenIssuer for FakeGithub {
+        async fn mint_repository_token(
+            &self,
+            installation_id: u64,
+            repository_id: u64,
+        ) -> anyhow::Result<crate::github::InstallationToken> {
+            assert_eq!((installation_id, repository_id), (11, 22));
+            Ok(crate::github::InstallationToken {
+                token: "synthetic-github-token".into(),
+                expires_at: Utc::now() + ChronoDuration::hours(1),
+            })
+        }
+    }
+
+    #[sqlx::test]
+    async fn credentials_are_scoped_to_the_tenant_and_never_sent_in_script(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        sqlx::query("UPDATE tasks SET repo_url = 'https://github.com/owner/repo' WHERE id = $1")
+            .bind(t.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let name = format!("/factory/{DEPLOYMENT}/tenants/{}/model-key", t.tenant_id);
+        sqlx::query("INSERT INTO repository_credentials (tenant_id, repository, installation_id, repository_id, model_key_parameter) VALUES ($1, 'owner/repo', 11, 22, $2)")
+            .bind(t.tenant_id).bind(&name).execute(&pool).await.unwrap();
+        cloud.set_source_secret(&name, "synthetic-model-key");
+        let r = r.with_github(FakeGithub);
+        r.tick().await.unwrap();
+        let script = &cloud.scripts()[0].script;
+        let credentials = cloud.secret_for_script(script);
+        assert_eq!(credentials["github_token"], "synthetic-github-token");
+        assert_eq!(credentials["model_api_key"], "synthetic-model-key");
+        for key in ["github_token", "model_api_key", "callback_token"] {
+            assert!(!script.contains(credentials[key].as_str().unwrap()));
+        }
+        assert!(
+            db::record_result(
+                &pool,
+                t.id,
+                credentials["callback_token"].as_str().unwrap(),
+                "hello"
+            )
+            .await
+            .unwrap()
+        );
+        r.tick().await.unwrap();
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn unapproved_repository_gets_no_credentials_or_script(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        let r = r.with_github(FakeGithub);
+        r.tick().await.unwrap();
+        assert!(cloud.scripts().is_empty());
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+        let failed = task(&pool, t.id).await;
+        assert!(failed.agent_command_id.is_none());
+        assert_eq!(failed.state, TaskState::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("repository not configured for tenant")
+        );
+    }
+
+    #[sqlx::test]
+    async fn failed_secret_write_does_not_send_or_commit_token(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        cloud.fail_secret_write(true);
+        r.tick().await.unwrap();
+        assert!(cloud.scripts().is_empty());
+        assert!(task(&pool, t.id).await.agent_command_id.is_none());
+        cloud.fail_secret_write(false);
+        r.tick().await.unwrap();
+        let script = &cloud.scripts()[0].script;
+        assert!(
+            db::record_heartbeat(&pool, t.id, &token_in(&cloud, script))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn restart_sweeps_unrecorded_and_finished_secrets_and_retries_deletes(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        // A put accepted before a process crash, without a saved SSM command.
+        cloud
+            .put_task_secret(
+                t.tenant_id,
+                t.id,
+                t.vm_instance_id.as_deref().unwrap(),
+                "old attempt",
+            )
+            .await
+            .unwrap();
+        cloud
+            .put_task_secret(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "i-1234567890abcdef0",
+                "orphan",
+            )
+            .await
+            .unwrap();
+        reconciler(&pool, &cloud).tick().await.unwrap();
+        assert_eq!(
+            cloud.list_task_secrets().await.unwrap().len(),
+            2,
+            "live task attempts retained, orphan deleted"
+        );
+        expire(&pool, t.id).await;
+        cloud.fail_secret_delete(true);
+        reconciler(&pool, &cloud).tick().await.unwrap();
+        assert!(
+            cloud.alive().is_empty(),
+            "cleanup failure must not block VM termination"
+        );
+        assert_eq!(cloud.list_task_secrets().await.unwrap().len(), 2);
+        cloud.fail_secret_delete(false);
+        reconciler(&pool, &cloud).tick().await.unwrap();
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn foreign_tenant_key_and_missing_source_secret_fail_with_clear_reasons(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        for foreign in [true, false] {
+            let r = reconciler(&pool, &cloud);
+            let t = running_without_agent(&pool, &r, &cloud).await;
+            sqlx::query(
+                "UPDATE tasks SET repo_url = 'https://github.com/owner/repo' WHERE id = $1",
+            )
+            .bind(t.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let owner = if foreign { Uuid::new_v4() } else { t.tenant_id };
+            sqlx::query("INSERT INTO repository_credentials (tenant_id, repository, installation_id, repository_id, model_key_parameter) VALUES ($1, 'owner/repo', 11, 22, $2)")
+                .bind(t.tenant_id).bind(format!("/factory/{DEPLOYMENT}/tenants/{owner}/model-key")).execute(&pool).await.unwrap();
+            r.with_github(FakeGithub).tick().await.unwrap();
+            assert!(cloud.scripts().is_empty());
+            assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+            let failed = task(&pool, t.id).await;
+            assert_eq!(failed.state, TaskState::Failed);
+            assert_eq!(
+                failed.failure_reason.as_deref(),
+                Some(if foreign {
+                    "model key parameter does not belong to tenant"
+                } else {
+                    "configured secret does not exist"
+                })
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn ssm_warmup_creates_no_bundles_and_definite_rejection_deletes_attempt(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        let vm = t.vm_instance_id.as_deref().unwrap();
+        cloud.ssm_unreachable(vm);
+        for _ in 0..3 {
+            r.tick().await.unwrap();
+        }
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+        cloud.ssm_reachable(vm);
+        cloud.disconnect_on_send();
+        r.tick().await.unwrap();
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+        assert!(cloud.scripts().is_empty());
+        r.tick().await.unwrap();
+        assert_eq!(cloud.list_task_secrets().await.unwrap().len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn slow_secret_listing_cannot_block_expired_vm_termination(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        expire(&pool, t.id).await;
+        cloud.hang_secret_list();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), r.tick())
+                .await
+                .is_err()
+        );
+        assert!(cloud.alive().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn oversized_serialized_credentials_never_reach_send_command(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        sqlx::query("UPDATE tasks SET repo_url = 'https://github.com/owner/repo' WHERE id = $1")
+            .bind(t.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let name = format!("/factory/{DEPLOYMENT}/tenants/{}/model-key", t.tenant_id);
+        sqlx::query("INSERT INTO repository_credentials (tenant_id, repository, installation_id, repository_id, model_key_parameter) VALUES ($1, 'owner/repo', 11, 22, $2)")
+            .bind(t.tenant_id).bind(&name).execute(&pool).await.unwrap();
+        cloud.set_source_secret(&name, &"\"".repeat(2048));
+        r.with_github(FakeGithub).tick().await.unwrap();
+        assert!(cloud.scripts().is_empty());
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+        let failed = task(&pool, t.id).await;
+        assert!(failed.agent_command_id.is_none());
+        assert_eq!(failed.state, TaskState::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("task credentials exceed the 4096-byte limit")
+        );
+        // A second tick does not try to mint or dispatch for a terminal task.
+        reconciler(&pool, &cloud).tick().await.unwrap();
+        assert!(cloud.scripts().is_empty());
+    }
+    #[sqlx::test]
+    async fn secret_sweep_reads_live_tasks_after_a_concurrent_put(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let (entered, resume) = cloud.pause_next_secret_list();
+        let tick = tokio::spawn(async move { r.tick().await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let t = queued_task(&pool).await;
+        let secret = cloud
+            .put_task_secret(
+                t.tenant_id,
+                t.id,
+                "i-1234567890abcdef0",
+                "concurrent bundle",
+            )
+            .await
+            .unwrap();
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), tick)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            cloud
+                .list_task_secrets()
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.name == secret.name)
+        );
+    }
+    struct UninstalledGithub;
+    impl RepositoryTokenIssuer for UninstalledGithub {
+        async fn mint_repository_token(&self, _: u64, _: u64) -> anyhow::Result<InstallationToken> {
+            Err(crate::github::GitHubConfigurationError { status: 404 }.into())
+        }
+    }
+
+    #[sqlx::test]
+    async fn permanent_github_scope_errors_fail_task_and_terminate_vm(pool: PgPool) {
+        let cloud = Arc::new(FakeCloud::default());
+        let r = reconciler(&pool, &cloud);
+        let t = running_without_agent(&pool, &r, &cloud).await;
+        sqlx::query("UPDATE tasks SET repo_url = 'https://github.com/owner/repo' WHERE id = $1")
+            .bind(t.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let name = format!("/factory/{DEPLOYMENT}/tenants/{}/model-key", t.tenant_id);
+        sqlx::query("INSERT INTO repository_credentials (tenant_id, repository, installation_id, repository_id, model_key_parameter) VALUES ($1, 'owner/repo', 11, 22, $2)")
+            .bind(t.tenant_id).bind(&name).execute(&pool).await.unwrap();
+        cloud.set_source_secret(&name, "synthetic-model-key");
+        r.with_github(UninstalledGithub).tick().await.unwrap();
+        let failed = task(&pool, t.id).await;
+        assert_eq!(failed.state, TaskState::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("GitHub repository installation is not configured (HTTP 404)")
+        );
+        assert!(cloud.scripts().is_empty());
+        assert!(cloud.list_task_secrets().await.unwrap().is_empty());
+        assert!(cloud.alive().is_empty());
     }
 }

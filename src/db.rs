@@ -260,6 +260,17 @@ pub async fn mark_running(pool: &PgPool, id: Uuid) -> anyhow::Result<bool> {
     Ok(result.rows_affected() == 1)
 }
 
+/// Records a permanent credential configuration failure while the caller holds the task lock.
+pub async fn fail_agent_start<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    id: Uuid,
+    reason: &str,
+) -> anyhow::Result<()> {
+    sqlx::query!("UPDATE tasks SET state = 'failed', failure_reason = $2, heartbeat_token_hash = NULL WHERE id = $1 AND state = 'running' AND agent_command_id IS NULL", id, reason)
+        .execute(executor).await.context("recording agent configuration failure")?;
+    Ok(())
+}
+
 /// Sets the token the agent will authenticate with, replacing any earlier one, before the
 /// agent command is sent. Only its sha256 is stored. Returns false if the task is no longer
 /// running, its agent has already been started, or another transaction holds the task

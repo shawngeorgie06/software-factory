@@ -43,7 +43,14 @@ struct Inner {
     scripts: Vec<SentScript>,
     ssm_unreachable: Vec<String>,
     failing_scripts: usize,
-    hang_after_next_send: bool,
+    hang_after_next_send: Option<Arc<tokio::sync::Notify>>,
+    secrets: BTreeMap<String, (super::StoredTaskSecret, String, String)>,
+    source_secrets: BTreeMap<String, String>,
+    fail_secret_write: bool,
+    fail_secret_delete: bool,
+    hang_secret_list: bool,
+    disconnect_on_send: bool,
+    secret_list_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 /// A script `run_script` accepted.
@@ -61,6 +68,48 @@ pub struct FakeCloud {
 }
 
 impl FakeCloud {
+    pub fn pause_next_secret_list(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let pair = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        self.with(|i| i.secret_list_pause = Some(pair.clone()));
+        pair
+    }
+    pub fn hang_secret_list(&self) {
+        self.with(|i| i.hang_secret_list = true);
+    }
+    pub fn disconnect_on_send(&self) {
+        self.with(|i| i.disconnect_on_send = true);
+    }
+
+    pub fn set_source_secret(&self, name: &str, value: &str) {
+        self.with(|inner| {
+            inner.source_secrets.insert(name.into(), value.into());
+        });
+    }
+    pub fn secret_value(&self, name: &str) -> String {
+        self.with(|inner| inner.secrets.get(name).unwrap().1.clone())
+    }
+    pub fn secret_for_script(&self, script: &str) -> serde_json::Value {
+        let line = script
+            .lines()
+            .find(|s| s.starts_with("parameter="))
+            .unwrap();
+        let name = line
+            .strip_prefix("parameter='")
+            .unwrap()
+            .strip_suffix('\'')
+            .unwrap();
+        serde_json::from_str(&self.secret_value(name)).unwrap()
+    }
+    pub fn fail_secret_write(&self, fail: bool) {
+        self.with(|i| i.fail_secret_write = fail);
+    }
+    pub fn fail_secret_delete(&self, fail: bool) {
+        self.with(|i| i.fail_secret_delete = fail);
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
         f(&mut self.inner.lock().unwrap())
     }
@@ -169,12 +218,81 @@ impl FakeCloud {
 
     /// The next accepted script is recorded as sent, but `run_script` never returns, like
     /// an SSM response that is lost.
-    pub fn hang_after_next_send(&self) {
-        self.with(|inner| inner.hang_after_next_send = true)
+    pub fn hang_after_next_send(&self) -> Arc<tokio::sync::Notify> {
+        let sent = Arc::new(tokio::sync::Notify::new());
+        self.with(|inner| inner.hang_after_next_send = Some(Arc::clone(&sent)));
+        sent
     }
 }
 
 impl Cloud for FakeCloud {
+    async fn script_ready(&self, instance_id: &str) -> anyhow::Result<bool> {
+        Ok(self.with(|i| {
+            i.instances
+                .get(instance_id)
+                .is_some_and(|vm| vm.state == FakeState::Running)
+                && !i.ssm_unreachable.iter().any(|id| id == instance_id)
+        }))
+    }
+
+    async fn read_secure(&self, name: &str) -> anyhow::Result<String> {
+        self.with(|i| i.source_secrets.get(name).cloned())
+            .ok_or_else(|| super::SecretConfigurationError::Missing.into())
+    }
+    async fn put_task_secret(
+        &self,
+        tenant_id: Uuid,
+        task_id: Uuid,
+        instance_id: &str,
+        value: &str,
+    ) -> anyhow::Result<super::SecretReference> {
+        self.with(|i| {
+            anyhow::ensure!(!i.fail_secret_write, "injected secret write failure");
+            anyhow::ensure!(value.len() <= 4096, "task secret exceeds 4096 bytes");
+            anyhow::ensure!(
+                instance_id
+                    .strip_prefix("i-")
+                    .is_some_and(|id| matches!(id.len(), 8 | 17)
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
+                "invalid EC2 instance id"
+            );
+            let name = format!(
+                "/factory/{DEPLOYMENT}/tasks/{tenant_id}/{task_id}/{}",
+                Uuid::new_v4()
+            );
+            let record = super::StoredTaskSecret {
+                name: name.clone(),
+                tenant_id,
+                task_id,
+            };
+            i.secrets
+                .insert(name.clone(), (record, value.into(), instance_id.into()));
+            Ok(super::SecretReference {
+                name,
+                region: "us-east-1".into(),
+            })
+        })
+    }
+    async fn list_task_secrets(&self) -> anyhow::Result<Vec<super::StoredTaskSecret>> {
+        if self.with(|i| i.hang_secret_list) {
+            std::future::pending::<()>().await;
+        }
+        if let Some((entered, resume)) = self.with(|i| i.secret_list_pause.take()) {
+            entered.notify_one();
+            resume.notified().await;
+        }
+        Ok(self.with(|i| i.secrets.values().map(|(s, _, _)| s.clone()).collect()))
+    }
+    async fn delete_task_secret(&self, name: &str) -> anyhow::Result<()> {
+        self.with(|i| {
+            anyhow::ensure!(!i.fail_secret_delete, "injected delete failure");
+            i.secrets.remove(name);
+            Ok(())
+        })
+    }
+
     async fn launch(&self, request: &LaunchRequest) -> anyhow::Result<String> {
         let token = request.task_id.to_string();
         let existing = self.with(|inner| {
@@ -253,6 +371,9 @@ impl Cloud for FakeCloud {
                 inner.failing_scripts -= 1;
                 bail!("injected SendCommand failure");
             }
+            if std::mem::take(&mut inner.disconnect_on_send) {
+                return Ok((ScriptStart::NotReady, None));
+            }
             let running = inner
                 .instances
                 .get(request.instance_id)
@@ -263,7 +384,7 @@ impl Cloud for FakeCloud {
                     .iter()
                     .any(|i| i == request.instance_id)
             {
-                return Ok((ScriptStart::NotReady, false));
+                return Ok((ScriptStart::NotReady, None));
             }
             let command_id = format!("cmd-{}", inner.scripts.len() + 1);
             inner.scripts.push(SentScript {
@@ -275,7 +396,8 @@ impl Cloud for FakeCloud {
             let hang = std::mem::take(&mut inner.hang_after_next_send);
             Ok((ScriptStart::Sent { command_id }, hang))
         })?;
-        if hang {
+        if let Some(sent) = hang {
+            sent.notify_one();
             std::future::pending::<()>().await;
         }
         Ok(start)
@@ -284,6 +406,29 @@ impl Cloud for FakeCloud {
 
 /// Lets a test keep a handle on the fake while a reconciler owns it.
 impl<C: Cloud> Cloud for Arc<C> {
+    async fn script_ready(&self, instance_id: &str) -> anyhow::Result<bool> {
+        C::script_ready(self, instance_id).await
+    }
+
+    async fn read_secure(&self, name: &str) -> anyhow::Result<String> {
+        C::read_secure(self, name).await
+    }
+    async fn put_task_secret(
+        &self,
+        tenant_id: Uuid,
+        task_id: Uuid,
+        instance_id: &str,
+        value: &str,
+    ) -> anyhow::Result<super::SecretReference> {
+        C::put_task_secret(self, tenant_id, task_id, instance_id, value).await
+    }
+    async fn list_task_secrets(&self) -> anyhow::Result<Vec<super::StoredTaskSecret>> {
+        C::list_task_secrets(self).await
+    }
+    async fn delete_task_secret(&self, name: &str) -> anyhow::Result<()> {
+        C::delete_task_secret(self, name).await
+    }
+
     async fn launch(&self, request: &LaunchRequest) -> anyhow::Result<String> {
         C::launch(self, request).await
     }

@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT installation_id, repository_id, model_key_parameter FROM repository_credentials WHERE tenant_id = $1 AND repository = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "installation_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_credentials",
+            "name": "installation_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_credentials",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "model_key_parameter",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_credentials",
+            "name": "model_key_parameter"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a9bd1882359ee7bc1a3fa5e80aadd6addcc89bd588b007711f42820285c88503"
+}
